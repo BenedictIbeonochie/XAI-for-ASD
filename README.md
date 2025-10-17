@@ -8,3 +8,6 @@ Early diagnosis and intervention for Autism Spectrum Disorder (ASD) has been sho
 
 https://arxiv.org/abs/2409.15374
 
+#### Paper
+
+The Lancet eClinicalMedicine, Aug 2025 - [DOI](https://doi.org/10.1016/j.eclinm.2025.103452)
