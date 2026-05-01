@@ -1,6 +1,9 @@
 import argparse
 import json
 import random
+from dataclasses import asdict, dataclass, field, is_dataclass
+from pathlib import Path
+from typing import Any
 import shap
 import torch
 import torch.nn as nn
@@ -24,20 +27,44 @@ from sklearn.model_selection import train_test_split, StratifiedKFold
 from captum.attr import IntegratedGradients, DeepLiftShap, DeepLift, GradientShap, ShapleyValueSampling, ShapleyValues, FeatureAblation, GuidedBackprop, Occlusion
 from nilearn import datasets, plotting
 import networkx as nx
-from lime import lime_tabular
 from functools import reduce
 from sklearn.metrics import jaccard_score
 from sklearn.metrics.pairwise import cosine_similarity
 
+try:
+  from lime import lime_tabular
+except ImportError:
+  lime_tabular = None
+
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda:0" if use_cuda else "cpu")
+DEFAULT_SEED = 2109459083
+LEGACY_ARTIFACT_MESSAGE = (
+  "Legacy globally selected feature artifacts are disabled in correction mode. "
+  "Recompute fold-specific feature selections from the raw ROI time-series instead."
+)
+DEFAULT_INTERPRETATION_METHODS = (
+  "Integrated Gradients",
+  "SHAP",
+  "LIME",
+  "GuidedBackprop",
+  "DeepLift",
+  "DeepLiftShap",
+  "GradientShap",
+)
 
 def get_data_from_abide(pipeline):
   downloads = f'abide/downloads/Outputs/{pipeline}/filt_global/rois_aal/'
   pheno_file = 'data/Phenotypic_V1_0b_preprocessed1.csv'
 
-  pheno_file = open(pheno_file, 'r')
-  pheno_list = pheno_file.readlines()
+  if not os.path.isdir(downloads):
+    raise FileNotFoundError(
+      f"Could not find raw ROI time-series for pipeline '{pipeline}' at '{downloads}'. "
+      "The corrected reanalysis requires the original subject-level ROI files rather than the legacy globally selected feature CSVs."
+    )
+
+  with open(pheno_file, 'r', encoding='utf-8') as phenotypic_file:
+    pheno_list = phenotypic_file.readlines()
 
   labels_dict = {}
   for i in pheno_list[1:]:
@@ -93,24 +120,28 @@ def get_feature_vecs(data):
 
   return feature_vecs, feature_indices
 
-def get_top_features_from_SVM_RFE(X, Y, indices, N, step):
+def get_top_features_from_SVM_RFE(X, Y, indices, N, step, training_sample_indices=None):
+  roi_lookup = prepare_feature_index_lookup(indices)
   svm = SVC(kernel="linear")
-  rfe = RFE(estimator=svm, n_features_to_select=N, step=step, verbose=1)
-
+  rfe = RFE(estimator=svm, n_features_to_select=N, step=step, verbose=0)
   rfe.fit(X, Y)
-
-  top_features = rfe.transform(X)
   top_indices = np.where(rfe.support_)[0]
+  top_rois = roi_lookup[top_indices].astype(int)
 
-  top_ROIs = []
+  if training_sample_indices is None:
+    training_sample_indices = np.arange(len(X))
 
-  for i in top_indices:
-    roi = indices[0][i]
-    top_ROIs.append(roi)
+  return RFESelection(
+    selected_feature_indices=np.asarray(top_indices, dtype=int),
+    selected_roi_pairs=np.asarray(top_rois, dtype=int),
+    training_sample_indices=np.asarray(training_sample_indices, dtype=int),
+  )
 
-  top_ROIs = np.array(top_ROIs)
 
-  return top_features, top_ROIs 
+def load_legacy_selected_features(*args, correction_mode=True, **kwargs):
+  if correction_mode:
+    raise RuntimeError(LEGACY_ARTIFACT_MESSAGE)
+  raise NotImplementedError("Legacy artifact loading is not supported by the corrected workflow.")
 
 def fishers_z_transform(x):
   # Handling the case where correlation coefficient is 1 or -1
@@ -127,6 +158,212 @@ def safe_divide(numerator, denominator):
       return 0
   else:
       return numerator / denominator
+
+
+@dataclass
+class ReanalysisConfig:
+  n_splits: int = 5
+  num_selected_features: int = 1000
+  rfe_step: int = 20
+  validation_size: float = 0.2
+  batch_size: int = 128
+  ae1_epochs: int = 50
+  ae2_epochs: int = 50
+  classifier_epochs: int = 300
+  fine_tuning_epochs: int = 125
+  ae_learning_rate: float = 0.001
+  classifier_learning_rate: float = 0.001
+  fine_tuning_learning_rate: float = 0.0001
+  weight_decay: float = 1e-4
+  random_seed: int = DEFAULT_SEED
+  ae1_hidden_size: int | None = 500
+  ae2_hidden_size: int | None = 100
+  explanation_methods: tuple[str, ...] = DEFAULT_INTERPRETATION_METHODS
+  explanation_top_n: int = 50
+  explanation_background_samples: int = 100
+  explanation_test_samples: int = 5
+  artifact_root: str = "artifacts/reanalysis"
+  save_artifacts: bool = True
+  save_model_checkpoints: bool = False
+  correction_mode: bool = True
+
+
+@dataclass
+class RFESelection:
+  selected_feature_indices: np.ndarray
+  selected_roi_pairs: np.ndarray
+  training_sample_indices: np.ndarray
+
+
+@dataclass
+class ExplanationRanking:
+  roi_pairs: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=int))
+  weights: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=float))
+  feature_indices: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=int))
+  skipped_reason: str | None = None
+
+
+@dataclass
+class FoldResult:
+  fold_id: int
+  outer_train_indices: np.ndarray
+  train_indices: np.ndarray
+  validation_indices: np.ndarray
+  test_indices: np.ndarray
+  selection: RFESelection
+  metrics: dict[str, Any]
+  true_labels: np.ndarray
+  predicted_labels: np.ndarray
+  train_feature_shape: tuple[int, int]
+  validation_feature_shape: tuple[int, int]
+  test_feature_shape: tuple[int, int]
+  explanation_rankings: dict[str, ExplanationRanking] = field(default_factory=dict)
+  artifact_dir: str | None = None
+  model_checkpoint_path: str | None = None
+
+
+@dataclass
+class PipelineRunSummary:
+  pipeline: str
+  config: ReanalysisConfig
+  fold_results: list[FoldResult]
+  metrics_summary: dict[str, Any]
+  interpretation_summary: dict[str, Any]
+  artifact_dir: str | None = None
+  legacy_artifacts_blocked: bool = True
+
+
+def set_random_seed(seed):
+  torch.manual_seed(seed)
+  np.random.seed(seed)
+  random.seed(seed)
+  if use_cuda:
+    torch.cuda.manual_seed_all(seed)
+
+
+def ensure_directory(path):
+  path = Path(path)
+  path.mkdir(parents=True, exist_ok=True)
+  return path
+
+
+def slugify_method_name(method_name):
+  return method_name.lower().replace(" ", "_")
+
+
+def prepare_feature_index_lookup(indices):
+  indices = np.asarray(indices)
+  if indices.ndim == 3:
+    return indices[0]
+  if indices.ndim == 2 and indices.shape[1] == 2:
+    return indices
+  raise ValueError("indices must have shape (samples, features, 2) or (features, 2)")
+
+
+def apply_feature_selection(features, selection):
+  return np.asarray(features)[:, selection.selected_feature_indices]
+
+
+def build_dataloader(features, labels, batch_size, shuffle):
+  features_tensor = torch.tensor(np.asarray(features), dtype=torch.float32)
+  labels_tensor = torch.tensor(np.asarray(labels), dtype=torch.long)
+  dataset = TensorDataset(features_tensor, labels_tensor)
+  return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0)
+
+
+def split_outer_train_validation(outer_train_indices, labels, validation_size, seed):
+  outer_train_indices = np.asarray(outer_train_indices)
+  stratify_labels = np.asarray(labels)[outer_train_indices]
+  unique_labels, counts = np.unique(stratify_labels, return_counts=True)
+  stratify = stratify_labels if len(unique_labels) > 1 and np.min(counts) > 1 else None
+
+  train_indices, validation_indices = train_test_split(
+    outer_train_indices,
+    test_size=validation_size,
+    random_state=seed,
+    stratify=stratify,
+  )
+
+  return np.asarray(train_indices), np.asarray(validation_indices)
+
+
+def resolve_hidden_layer_sizes(input_size, config):
+  ae1_hidden_size = config.ae1_hidden_size if config.ae1_hidden_size is not None else min(500, input_size)
+  ae1_hidden_size = max(1, min(ae1_hidden_size, max(1, input_size)))
+  ae2_hidden_size = config.ae2_hidden_size if config.ae2_hidden_size is not None else min(100, ae1_hidden_size)
+  ae2_hidden_size = max(1, min(ae2_hidden_size, ae1_hidden_size))
+  return ae1_hidden_size, ae2_hidden_size
+
+
+def compute_binary_metrics(true_labels, predicted_labels, positive_label=0):
+  true_labels = np.asarray(true_labels).astype(int)
+  predicted_labels = np.asarray(predicted_labels).astype(int)
+
+  tp = int(np.sum((true_labels == positive_label) & (predicted_labels == positive_label)))
+  tn = int(np.sum((true_labels != positive_label) & (predicted_labels != positive_label)))
+  fp = int(np.sum((true_labels != positive_label) & (predicted_labels == positive_label)))
+  fn = int(np.sum((true_labels == positive_label) & (predicted_labels != positive_label)))
+
+  accuracy = safe_divide(tp + tn, tp + tn + fp + fn)
+  sensitivity = safe_divide(tp, tp + fn)
+  specificity = safe_divide(tn, tn + fp)
+  precision = safe_divide(tp, tp + fp)
+  f1 = safe_divide((2 * precision * sensitivity), (precision + sensitivity))
+
+  return {
+    'accuracy': accuracy,
+    'sensitivity': sensitivity,
+    'specificity': specificity,
+    'precision': precision,
+    'f1': f1,
+    'confusion_matrix': np.array([[tp, fp], [fn, tn]]),
+    'tp': tp,
+    'fp': fp,
+    'fn': fn,
+    'tn': tn,
+  }
+
+
+def summarize_metrics(fold_results):
+  metric_names = ('accuracy', 'sensitivity', 'specificity', 'precision', 'f1')
+  summary = {}
+
+  for metric_name in metric_names:
+    values = [fold_result.metrics[metric_name] for fold_result in fold_results]
+    summary[metric_name] = {
+      'mean': float(np.mean(values)),
+      'std': float(np.std(values)),
+      'values': [float(value) for value in values],
+    }
+
+  return summary
+
+
+def to_serializable(value):
+  if is_dataclass(value):
+    return {key: to_serializable(val) for key, val in asdict(value).items()}
+  if isinstance(value, pd.DataFrame):
+    return value.to_dict(orient='records')
+  if isinstance(value, dict):
+    return {str(key): to_serializable(val) for key, val in value.items()}
+  if isinstance(value, (list, tuple)):
+    return [to_serializable(item) for item in value]
+  if isinstance(value, np.ndarray):
+    return value.tolist()
+  if isinstance(value, (np.integer,)):
+    return int(value)
+  if isinstance(value, (np.floating,)):
+    return float(value)
+  if isinstance(value, Path):
+    return str(value)
+  return value
+
+
+def write_json_file(path, payload):
+  path = Path(path)
+  ensure_directory(path.parent)
+  with open(path, 'w', encoding='utf-8') as json_file:
+    json.dump(to_serializable(payload), json_file, indent=2)
   
 
 class Autoencoder(nn.Module):
@@ -251,6 +488,8 @@ def get_encoded_data(model, dataloader, dataloader_params, device):
   return encoded_dataset, encoded_dataset_loader
 
 def find_top_rois_using_LIME(N, model, test_dataloader, train_dataloader, rois):
+  if lime_tabular is None:
+    raise ImportError("LIME is not installed in this environment.")
   features_list = []
   labels_list = []
 
@@ -299,8 +538,8 @@ def find_top_rois_using_LIME(N, model, test_dataloader, train_dataloader, rois):
   # Generate explanation for the selected instance
   explanation = explainer.explain_instance(
       data_row=instance, 
-      predict_fn=model_predict_lime,  # Use the prediction function defined above
-      num_features=1000,  # Number of top features you want to show
+      predict_fn=lambda batch: model_predict_lime(model, batch),
+      num_features=min(1000, X_train.shape[1]),  # Number of top features you want to show
       top_labels=1  # Number of top labels for multi-class classification
   )
 
@@ -490,6 +729,18 @@ def find_top_rois_using_GuidedBackprop(N, model, test_dataloader, rois):
 
   return rois[top_indices], abs_attribution[top_indices], top_indices
 
+
+def get_interpretability_method_map():
+  return {
+    "Integrated Gradients": lambda top_n, model, test_dataloader, train_dataloader, rois: find_top_rois_using_integrated_gradients(top_n, model, test_dataloader, rois),
+    "SHAP": lambda top_n, model, test_dataloader, train_dataloader, rois: find_top_rois_using_SHAP(top_n, model, test_dataloader, train_dataloader, rois),
+    "LIME": lambda top_n, model, test_dataloader, train_dataloader, rois: find_top_rois_using_LIME(top_n, model, test_dataloader, train_dataloader, rois),
+    "GuidedBackprop": lambda top_n, model, test_dataloader, train_dataloader, rois: find_top_rois_using_GuidedBackprop(top_n, model, test_dataloader, rois),
+    "DeepLift": lambda top_n, model, test_dataloader, train_dataloader, rois: find_top_rois_using_DeepLift(top_n, model, test_dataloader, rois),
+    "DeepLiftShap": lambda top_n, model, test_dataloader, train_dataloader, rois: find_top_rois_using_DeepLiftShap(top_n, model, test_dataloader, rois),
+    "GradientShap": lambda top_n, model, test_dataloader, train_dataloader, rois: find_top_rois_using_GradientShap(top_n, model, test_dataloader, rois),
+  }
+
 def get_threshold_from_percentile(adjacency_matrix, percentile):
   all_weights = adjacency_matrix[np.nonzero(adjacency_matrix)]
   threshold = np.percentile(all_weights, percentile) 
@@ -662,7 +913,7 @@ def print_connections(rois, weights, method, pipeline, top_regions=50, top_regio
 
   return top_connections_df, top_rois_df
 
-def model_predict_lime(data):
+def model_predict_lime(model, data):
   # Convert data to tensor, pass through model, and return softmax probabilities
   data_tensor = torch.tensor(data).float().to(device)
   model.eval()
@@ -672,415 +923,440 @@ def model_predict_lime(data):
 
   return probabilities
 
-def train_and_eval_model(top_features, labels_from_abide, pipeline, verbose=False, train_model=True, save_model=False, rfe_step=1):
-  skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)  # Example with 5 folds
+def train_single_fold_model(train_dataloader, val_dataloader, input_size, config, verbose=False):
+  ae1_hidden_size, ae2_hidden_size = resolve_hidden_layer_sizes(input_size, config)
 
-  avg_TP, avg_FP, avg_FN, avg_TN = [], [], [], []
+  ae1 = Autoencoder(input_size, ae1_hidden_size).to(device)
+  ae2 = Autoencoder(ae1_hidden_size, ae2_hidden_size).to(device)
+  classifier = SoftmaxClassifier(ae2_hidden_size, 2).to(device)
+  model = StackedAutoencoder(ae1, ae2, classifier).to(device)
 
-  fold = 0
-  for train_idx, test_idx in skf.split(top_features, labels_from_abide):
-    fold+=1
+  optimizer_ae1 = optim.Adam(ae1.parameters(), lr=config.ae_learning_rate, weight_decay=config.weight_decay)
+  optimizer_ae2 = optim.Adam(ae2.parameters(), lr=config.ae_learning_rate, weight_decay=config.weight_decay)
+  optimizer_classifier = optim.Adam(classifier.parameters(), lr=config.classifier_learning_rate, weight_decay=config.weight_decay)
+  optimizer_model = optim.Adam(model.parameters(), lr=config.fine_tuning_learning_rate, weight_decay=config.weight_decay)
+  classifier_criterion = nn.CrossEntropyLoss()
 
-    if verbose:
-      print(f'======================================\nSplit {fold}\n======================================')
-    
-    dataset = {}
-    label = {}
-
-    # Split the training set into training and validation
-    train_subidx, val_subidx = train_test_split(train_idx, test_size=0.1, random_state=seed)  # Adjust test_size as needed
-
-    dataset['train'] = Subset(top_features, train_subidx)
-    label['train'] = Subset(labels_from_abide, train_subidx)
-
-    dataset['val'] = Subset(top_features, val_subidx)
-    label['val'] = Subset(labels_from_abide, val_subidx)
-
-    dataset['test'] = Subset(top_features, test_idx)
-    label['test'] = Subset(labels_from_abide, test_idx)
+  for epoch in range(config.ae1_epochs):
+    for data, _ in train_dataloader:
+      data = data.float().to(device)
+      optimizer_ae1.zero_grad()
+      _, _, loss = ae1(data)
+      loss.backward()
+      optimizer_ae1.step()
 
     if verbose:
-      print("Total: ", len(top_features))  # Original dataset size
-      print("Train: ", len(dataset['train'].indices)) 
-      print("Test: ", len(dataset['test'].indices)) 
-      print("Validation: ", len(dataset['val'].indices)) 
+      print(f"AE1 epoch {epoch + 1}/{config.ae1_epochs} loss={loss.item():.6f}")
 
-    train_set = CustomDataset(dataset['train'], label['train'])
-    test_set = CustomDataset(dataset['test'], label['test'])
-    val_set = CustomDataset(dataset['val'],label['val'])
+  encoded_train_dataset, encoded_train_loader = get_encoded_data(
+    ae1,
+    train_dataloader,
+    {'batch_size': config.batch_size, 'shuffle': True, 'num_workers': 0},
+    device,
+  )
+  _, encoded_val_loader = get_encoded_data(
+    ae1,
+    val_dataloader,
+    {'batch_size': config.batch_size, 'shuffle': False, 'num_workers': 0},
+    device,
+  )
 
-    params = {
-      'batch_size': 128,
-      'shuffle': True,
-      'num_workers': 0
-    }
-
-    val_params = {
-      'batch_size': 128,
-      'shuffle': False,
-      'num_workers': 0
-    }
-
-    test_params = {
-      'batch_size': 128,
-      'shuffle': False,
-      'num_workers': 0
-    }
-    
-    train_dataloader = DataLoader(train_set, **params)
-    test_dataloader = DataLoader(test_set, **test_params)
-    val_dataloader = DataLoader(val_set, **val_params)
-
-    AE1 = Autoencoder(1000, 500).to(device)
-    AE2 = Autoencoder(500, 100).to(device)
-    classifier = SoftmaxClassifier(100, 2).to(device)
-    model = StackedAutoencoder(AE1, AE2, classifier).to(device)
-
-    if (train_model):
-      AE1_epochs = 50
-      optimizer_ae1 = optim.Adam( AE1.parameters(), lr=0.001, weight_decay=1e-4 )
-      
-      AE2_epochs = 50
-      optimizer_ae2 = optim.Adam( AE2.parameters(), lr=0.001, weight_decay=1e-4 )
-
-      classifier_epochs = 300
-      optimizer_classifier = optim.Adam( classifier.parameters(), lr=0.001, weight_decay=1e-4 )
-
-      optimizer = optim.Adam(model.parameters(), lr=0.0001)
-
-      ae_criterion = nn.MSELoss()
-      classifier_criterion = nn.CrossEntropyLoss()
-
-      fine_tuning_epochs = 125
-
-      loss_ae1 = []
-      val_ae1 = []
-
-      for epoch in range(AE1_epochs):
-        for batch in train_dataloader:
-          data, labels = batch
-          data = data.float().to(device) 
-
-          optimizer_ae1.zero_grad()
-
-          encoded_features, decoded_featues, loss = AE1(data)
-
-          loss.backward()
-          optimizer_ae1.step()
-        loss_ae1.append(loss.item())
-
-        val_loss = 0.0
-        with torch.no_grad():
-          for batch in val_dataloader:
-            data, labels = batch
-            data = data.float().to(device)
-
-            encoded_features, decoded_featues, loss = AE1(data)
-            val_loss += loss.item()
-
-        val_loss /= len(val_dataloader)
-        val_ae1.append(val_loss)
-
-        if verbose:
-          print(f"AE 1: Epoch {epoch}, loss {loss.item()}, validation loss {val_loss}")
-      
-      if verbose:
-        print("======================================\nTrained AE 1\n======================================")
-
-      encoded_dataset, encoded_dataset_loader = get_encoded_data(AE1, train_dataloader, params, device)
-
-      val_encoded_dataset, val_encoded_dataset_loader = get_encoded_data(AE1, val_dataloader, val_params, device)
-
-      loss_ae2 = []
-      val_ae2 = []
-
-      for epoch in range(AE2_epochs):
-        for batch in encoded_dataset_loader:
-          data, labels = batch
-          data = data.float().to(device) 
-
-          optimizer_ae2.zero_grad()
-
-          encoded_features, decoded_featues, loss = AE2(data)
-
-          loss.backward()
-          optimizer_ae2.step()
-        loss_ae2.append(loss.item())
-
-        val_loss = 0.0
-        with torch.no_grad():
-          for batch in val_encoded_dataset_loader:
-            data, labels = batch
-            data = data.float().to(device)
-
-            encoded_features, decoded_featues, loss = AE2(data)
-            val_loss += loss.item()
-
-        val_loss /= len(val_encoded_dataset_loader)
-        val_ae2.append(val_loss)
-
-        if verbose:
-          print(f"AE 2: Epoch {epoch}, loss {loss.item()}, validation loss {val_loss}")
-
-      if verbose:
-        print("======================================\nTrained AE 2\n======================================")
-
-      encoded_dataset, encoded_dataset_loader = get_encoded_data(AE2, encoded_dataset_loader, params, device)
-
-      val_encoded_dataset, val_encoded_dataset_loader = get_encoded_data(AE2, val_encoded_dataset_loader, val_params, device)
-
-      loss_classifier = []
-      val_classifier = []
-
-      for epoch in range(classifier_epochs):
-        for batch in encoded_dataset_loader:
-          data, labels = batch
-          data = data.float().to(device) 
-          labels = labels.long().to(device) 
-
-          optimizer_classifier.zero_grad()
-
-          classifier_output = classifier(data)
-
-          loss = classifier_criterion(classifier_output, labels)
-          loss.backward()
-          optimizer_classifier.step()
-
-        loss_classifier.append(loss.item())
-
-        val_loss = 0.0
-        with torch.no_grad():
-          for batch in val_encoded_dataset_loader:
-            data, labels = batch
-            data = data.float().to(device)
-            labels = labels.long().to(device) 
-
-            classifier_output = classifier(data)
-            loss = classifier_criterion(classifier_output, labels)
-
-            val_loss += loss.item()
-
-        val_loss /= len(val_encoded_dataset_loader)  # Average validation loss
-        val_classifier.append(val_loss)
-
-        if verbose:
-          print(f"Classifier: Epoch {epoch}, loss {loss.item()}, validation loss {val_loss}")
-
-      if verbose:
-        print("======================================\nTrained classifier\n======================================")
-
-      loss_model = []
-      accuracy_model = []
-      val_model = []
-      val_accuracy_model = []
-      for epoch in range(fine_tuning_epochs):
-        total = 0
-        correct = 0
-        for batch in train_dataloader:
-          data, labels = batch
-          data = data.float().to(device)
-          labels = labels.long().to(device) 
-
-          optimizer.zero_grad()
-          outputs = model(data)
-          _, predicted = torch.max(outputs.data, 1)
-          total += labels.size(0)
-          correct += (predicted == labels).sum().item()
-
-          loss = classifier_criterion(outputs, labels) 
-          loss.backward()
-          optimizer.step()
-        loss_model.append(loss.item())
-        accuracy_model.append(100 * correct / total)
-
-        val_loss = 0.0
-        val_total = 0
-        val_correct = 0
-        with torch.no_grad():
-          for batch in val_dataloader:
-            data, labels = batch
-            data = data.float().to(device)
-            labels = labels.long().to(device) 
-
-            outputs = model(data)
-            _, predicted = torch.max(outputs.data, 1)
-
-            loss = classifier_criterion(outputs, labels) 
-
-            val_total += labels.size(0)
-            val_correct += (predicted == labels).sum().item()
-
-            val_loss += loss.item()
-
-        val_accuracy_model.append(100 * val_correct / val_total)
-        val_loss /= len(val_dataloader)
-        val_model.append(val_loss)
-
-        if verbose:
-          print(f"Model: Epoch {epoch}, loss {loss.item()}, validation loss {val_loss}")
-      
-      if verbose:
-        print("======================================\nFine tuned model\n======================================")
-
-        dig, axs = plt.subplots(1, 5, figsize=(15,5))
-        # Plot for AE1
-        axs[0].plot(range(AE1_epochs), loss_ae1, label='Training Loss')
-        axs[0].plot(range(AE1_epochs), val_ae1, label='Validation Loss')
-        axs[0].set_title('AE1 Loss')
-        axs[0].set_xlabel('Epoch')
-        axs[0].set_ylabel('Loss')
-        axs[0].legend()
-
-        # Plot for AE2
-        axs[1].plot(range(AE2_epochs), loss_ae2, label='Training Loss')
-        axs[1].plot(range(AE2_epochs), val_ae2, label='Validation Loss')
-        axs[1].set_title('AE2 Loss')
-        axs[1].set_xlabel('Epoch')
-        axs[1].legend()
-
-        # Plot for classifier
-        axs[2].plot(range(classifier_epochs), loss_classifier, label='Training Loss')
-        axs[2].plot(range(classifier_epochs), val_classifier, label='Validation Loss')
-        axs[2].set_title('Classifier Loss')
-        axs[2].set_xlabel('Epoch')
-        axs[2].legend()
-
-        # Plot for Model
-        axs[3].plot(range(fine_tuning_epochs), loss_model, label='Training Loss')
-        axs[3].plot(range(fine_tuning_epochs), val_model, label='Validation Loss')
-        axs[3].set_title('Model Loss')
-        axs[3].set_xlabel('Epoch')
-        axs[3].legend()
-
-        # Plot for Accuracy over fine tuning
-        axs[4].plot(range(fine_tuning_epochs), accuracy_model, label='Training Accuracy')
-        axs[4].plot(range(fine_tuning_epochs), val_accuracy_model, label='Validation Accuracy')
-        axs[4].set_title('Accuracy')
-        axs[4].set_xlabel('Epoch')
-        axs[4].legend()
-
-        plt.tight_layout()
-
-        plt.show()
-
-      if save_model:
-        torch.save(model.state_dict(), f'models/model_{pipeline}_step{rfe_step}.pth')
-    else:
-      model.load_state_dict(torch.load(f'models/model_{pipeline}_step{rfe_step}.pth', map_location=torch.device(device)))
+  for epoch in range(config.ae2_epochs):
+    for data, _ in encoded_train_loader:
+      data = data.float().to(device)
+      optimizer_ae2.zero_grad()
+      _, _, loss = ae2(data)
+      loss.backward()
+      optimizer_ae2.step()
 
     if verbose:
-      print("======================================\nTesting Model\n======================================")
+      print(f"AE2 epoch {epoch + 1}/{config.ae2_epochs} loss={loss.item():.6f}")
 
-    model.eval()
+  _, encoded_classifier_train_loader = get_encoded_data(
+    ae2,
+    encoded_train_loader,
+    {'batch_size': config.batch_size, 'shuffle': True, 'num_workers': 0},
+    device,
+  )
+  _, encoded_classifier_val_loader = get_encoded_data(
+    ae2,
+    encoded_val_loader,
+    {'batch_size': config.batch_size, 'shuffle': False, 'num_workers': 0},
+    device,
+  )
 
-    true_labels = np.array([])
-    predicted_labels = np.array([])
-
-    for batch in test_dataloader:
-      data, labels = batch
+  for epoch in range(config.classifier_epochs):
+    for data, labels in encoded_classifier_train_loader:
       data = data.float().to(device)
       labels = labels.long().to(device)
-
-      outputs = model(data)
-
-      _, predicted = torch.max(outputs.data, 1)
-
-      true_labels = np.concatenate((true_labels,labels.cpu().numpy()),axis=0)
-      predicted_labels = np.concatenate((predicted_labels,predicted.cpu().numpy()),axis=0)
-
-    TP,FP,TN,FN = 0,0,0,0
-
-    for true_label, predicted_label in zip(true_labels, predicted_labels):
-      if true_label == predicted_label == 0:
-          TP += 1  # True Positive
-      elif true_label == predicted_label == 1:
-          TN += 1  # True Negative
-      elif true_label == 1 and predicted_label == 0:
-          FP += 1  # False Positive
-      elif true_label == 0 and predicted_label == 1:
-          FN += 1  # False Negative
-    
-    avg_TP.append(TP)
-    avg_FP.append(FP)
-    avg_FN.append(FN)
-    avg_TN.append(TN)
-
-    accuracy = safe_divide(TP + TN, TP + TN + FP + FN)
-    sensitivity = safe_divide(TP, TP + FN)
-    specificity = safe_divide(TN, TN + FP)
-    precision = safe_divide(TP, TP + FP)
-    
-    f1 = safe_divide((2 * precision * sensitivity), (precision + sensitivity))
-    cm = np.array([[TP,FP],[FN,TN]])
+      optimizer_classifier.zero_grad()
+      outputs = classifier(data)
+      loss = classifier_criterion(outputs, labels)
+      loss.backward()
+      optimizer_classifier.step()
 
     if verbose:
-      print(f'Accuracy: {(accuracy * 100):.2f}%')
-      print(f'Specificity: {specificity:.2f}')
-      print(f'Precision: {precision:.2f}')
-      print(f'F1_Score: {f1:.2f}')
-      print(f'Confusion Matrix:\n{cm}')
-      # sns.heatmap(cm, annot=True)
+      print(f"Classifier epoch {epoch + 1}/{config.classifier_epochs} loss={loss.item():.6f}")
 
-      # group_names = ['True Pos','False Pos','False Neg','True Neg']
-      # group_counts = ['{0:0.0f}'.format(value) for value in cm.flatten()]
-      # group_percentages = ['{0:.2%}'.format(value) for value in cm.flatten()/np.sum(cm)]
-      # labels = [f'{v1}\n{v2}\n{v3}' for v1, v2, v3 in zip(group_names,group_counts,group_percentages)]
-      # labels = np.asarray(labels).reshape(2,2)
-      # sns.heatmap(cm, annot=labels, fmt='', cmap='Blues')
-  
+  for epoch in range(config.fine_tuning_epochs):
+    for data, labels in train_dataloader:
+      data = data.float().to(device)
+      labels = labels.long().to(device)
+      optimizer_model.zero_grad()
+      outputs = model(data)
+      loss = classifier_criterion(outputs, labels)
+      loss.backward()
+      optimizer_model.step()
+
+    if verbose:
+      print(f"Fine-tuning epoch {epoch + 1}/{config.fine_tuning_epochs} loss={loss.item():.6f}")
+
+  return model
+
+
+def evaluate_model(model, test_dataloader):
+  model.eval()
+  true_labels = []
+  predicted_labels = []
+
+  with torch.no_grad():
+    for data, labels in test_dataloader:
+      data = data.float().to(device)
+      labels = labels.long().to(device)
+      outputs = model(data)
+      _, predicted = torch.max(outputs.data, 1)
+      true_labels.extend(labels.cpu().numpy())
+      predicted_labels.extend(predicted.cpu().numpy())
+
+  true_labels = np.asarray(true_labels, dtype=int)
+  predicted_labels = np.asarray(predicted_labels, dtype=int)
+  metrics = compute_binary_metrics(true_labels, predicted_labels)
+
+  return metrics, true_labels, predicted_labels
+
+
+def compute_fold_explanations(model, train_dataloader, test_dataloader, selected_roi_pairs, config):
+  explanation_rankings = {}
+  selected_roi_pairs = np.asarray(selected_roi_pairs, dtype=int)
+  method_map = get_interpretability_method_map()
+
+  for method_name in config.explanation_methods:
+    if method_name not in method_map:
+      explanation_rankings[method_name] = ExplanationRanking(
+        skipped_reason=f"Unknown interpretation method '{method_name}'.",
+      )
+      continue
+
+    try:
+      roi_pairs, weights, feature_indices = method_map[method_name](
+        config.explanation_top_n,
+        model,
+        test_dataloader,
+        train_dataloader,
+        selected_roi_pairs,
+      )
+      explanation_rankings[method_name] = ExplanationRanking(
+        roi_pairs=np.asarray(roi_pairs, dtype=int),
+        weights=np.asarray(weights, dtype=float),
+        feature_indices=np.asarray(feature_indices, dtype=int),
+      )
+    except Exception as error:
+      explanation_rankings[method_name] = ExplanationRanking(
+        skipped_reason=str(error),
+      )
+
+  return explanation_rankings
+
+
+def aggregate_explanations_across_folds(fold_results, top_n):
+  aggregated_results = {}
+  method_names = sorted({
+    method_name
+    for fold_result in fold_results
+    for method_name in fold_result.explanation_rankings.keys()
+  })
+
+  for method_name in method_names:
+    connection_records = []
+    roi_records = []
+    skipped_folds = []
+
+    for fold_result in fold_results:
+      explanation = fold_result.explanation_rankings.get(method_name)
+      if explanation is None:
+        continue
+      if explanation.skipped_reason:
+        skipped_folds.append({'fold_id': fold_result.fold_id, 'reason': explanation.skipped_reason})
+        continue
+
+      for rank, (roi_pair, weight) in enumerate(zip(explanation.roi_pairs[:top_n], explanation.weights[:top_n]), start=1):
+        roi_1, roi_2 = sorted(int(value) for value in roi_pair)
+        connection_records.append({
+          'fold_id': fold_result.fold_id,
+          'rank': rank,
+          'roi_1_index': roi_1,
+          'roi_2_index': roi_2,
+          'importance': float(weight),
+        })
+        roi_records.append({
+          'fold_id': fold_result.fold_id,
+          'rank': rank,
+          'roi_index': roi_1,
+          'importance': float(weight),
+        })
+        roi_records.append({
+          'fold_id': fold_result.fold_id,
+          'rank': rank,
+          'roi_index': roi_2,
+          'importance': float(weight),
+        })
+
+    if connection_records:
+      connections_df = pd.DataFrame(connection_records)
+      aggregated_connections = (
+        connections_df
+        .groupby(['roi_1_index', 'roi_2_index'], as_index=False)
+        .agg(
+          fold_occurrence=('fold_id', 'nunique'),
+          mean_importance=('importance', 'mean'),
+          median_rank=('rank', 'median'),
+        )
+        .sort_values(['fold_occurrence', 'mean_importance', 'median_rank'], ascending=[False, False, True])
+        .reset_index(drop=True)
+      )
+    else:
+      aggregated_connections = pd.DataFrame(columns=['roi_1_index', 'roi_2_index', 'fold_occurrence', 'mean_importance', 'median_rank'])
+
+    if roi_records:
+      rois_df = pd.DataFrame(roi_records)
+      aggregated_rois = (
+        rois_df
+        .groupby('roi_index', as_index=False)
+        .agg(
+          fold_occurrence=('fold_id', 'nunique'),
+          mean_importance=('importance', 'mean'),
+          median_rank=('rank', 'median'),
+        )
+        .sort_values(['fold_occurrence', 'mean_importance', 'median_rank'], ascending=[False, False, True])
+        .reset_index(drop=True)
+      )
+    else:
+      aggregated_rois = pd.DataFrame(columns=['roi_index', 'fold_occurrence', 'mean_importance', 'median_rank'])
+
+    aggregated_results[method_name] = {
+      'connections': aggregated_connections,
+      'rois': aggregated_rois,
+      'folds_aggregated': int(len(fold_results) - len(skipped_folds)),
+      'skipped_folds': skipped_folds,
+    }
+
+  return aggregated_results
+
+
+def write_fold_artifacts(fold_result, artifact_dir):
+  artifact_dir = ensure_directory(artifact_dir)
+  np.savetxt(artifact_dir / 'selected_feature_indices.csv', fold_result.selection.selected_feature_indices, delimiter=',', fmt='%d')
+  np.savetxt(artifact_dir / 'selected_roi_pairs.csv', fold_result.selection.selected_roi_pairs, delimiter=',', fmt='%d')
+
+  prediction_df = pd.DataFrame({
+    'sample_index': fold_result.test_indices,
+    'true_label': fold_result.true_labels,
+    'predicted_label': fold_result.predicted_labels,
+  })
+  prediction_df.to_csv(artifact_dir / 'predictions.csv', index=False)
+  write_json_file(artifact_dir / 'metrics.json', fold_result.metrics)
+
+  for method_name, explanation in fold_result.explanation_rankings.items():
+    method_slug = slugify_method_name(method_name)
+    if explanation.skipped_reason:
+      write_json_file(
+        artifact_dir / f'{method_slug}_explanation.json',
+        {'skipped_reason': explanation.skipped_reason},
+      )
+      continue
+
+    explanation_df = pd.DataFrame({
+      'feature_rank': np.arange(1, len(explanation.weights) + 1),
+      'feature_index': explanation.feature_indices,
+      'roi_1_index': explanation.roi_pairs[:, 0] if len(explanation.roi_pairs) else [],
+      'roi_2_index': explanation.roi_pairs[:, 1] if len(explanation.roi_pairs) else [],
+      'importance': explanation.weights,
+    })
+    explanation_df.to_csv(artifact_dir / f'{method_slug}_explanation.csv', index=False)
+
+
+def write_pipeline_artifacts(summary):
+  if not summary.config.save_artifacts or summary.artifact_dir is None:
+    return
+
+  artifact_dir = ensure_directory(summary.artifact_dir)
+
+  fold_metric_rows = []
+  for fold_result in summary.fold_results:
+    fold_metric_rows.append({
+      'fold_id': fold_result.fold_id,
+      'accuracy': fold_result.metrics['accuracy'],
+      'sensitivity': fold_result.metrics['sensitivity'],
+      'specificity': fold_result.metrics['specificity'],
+      'precision': fold_result.metrics['precision'],
+      'f1': fold_result.metrics['f1'],
+    })
+
+  pd.DataFrame(fold_metric_rows).to_csv(artifact_dir / 'fold_metrics.csv', index=False)
+
+  for method_name, interpretation_summary in summary.interpretation_summary.items():
+    method_slug = slugify_method_name(method_name)
+    interpretation_summary['connections'].to_csv(artifact_dir / f'{method_slug}_connections.csv', index=False)
+    interpretation_summary['rois'].to_csv(artifact_dir / f'{method_slug}_rois.csv', index=False)
+
+  write_json_file(artifact_dir / 'summary.json', summary)
+
+
+def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown', feature_indices=None, verbose=False, train_model=True, save_model=False, rfe_step=None, config=None):
+  if config is None:
+    config = ReanalysisConfig()
+
+  if rfe_step is not None:
+    config.rfe_step = rfe_step
+  if save_model:
+    config.save_model_checkpoints = True
+
+  if config.correction_mode and not train_model:
+    raise RuntimeError("Correction mode does not support loading legacy global checkpoints. Re-run the fold-specific training pipeline instead.")
+
+  if feature_indices is None:
+    raise ValueError("feature_indices must be provided for the corrected fold-specific reanalysis.")
+
+  feature_vectors = np.asarray(feature_vectors, dtype=float)
+  labels_from_abide = np.asarray(labels_from_abide, dtype=int)
+  roi_lookup = prepare_feature_index_lookup(feature_indices)
+
+  if feature_vectors.ndim != 2:
+    raise ValueError("feature_vectors must be a 2D array of shape (samples, features).")
+
+  set_random_seed(config.random_seed)
+  skf = StratifiedKFold(n_splits=config.n_splits, shuffle=True, random_state=config.random_seed)
+  selected_feature_count = min(config.num_selected_features, feature_vectors.shape[1])
+
+  pipeline_artifact_dir = None
+  if config.save_artifacts:
+    pipeline_artifact_dir = ensure_directory(Path(config.artifact_root) / pipeline)
+
+  fold_results = []
+
+  for fold_id, (outer_train_indices, test_indices) in enumerate(skf.split(feature_vectors, labels_from_abide), start=1):
+    if verbose:
+      print(f"======================================\nFold {fold_id}\n======================================")
+
+    outer_train_indices = np.asarray(outer_train_indices, dtype=int)
+    test_indices = np.asarray(test_indices, dtype=int)
+
+    selection = get_top_features_from_SVM_RFE(
+      feature_vectors[outer_train_indices],
+      labels_from_abide[outer_train_indices],
+      roi_lookup,
+      selected_feature_count,
+      config.rfe_step,
+      training_sample_indices=outer_train_indices,
+    )
+
+    train_indices, validation_indices = split_outer_train_validation(
+      outer_train_indices,
+      labels_from_abide,
+      config.validation_size,
+      config.random_seed + fold_id,
+    )
+
+    train_features = apply_feature_selection(feature_vectors[train_indices], selection)
+    validation_features = apply_feature_selection(feature_vectors[validation_indices], selection)
+    test_features = apply_feature_selection(feature_vectors[test_indices], selection)
+
+    train_labels = labels_from_abide[train_indices]
+    validation_labels = labels_from_abide[validation_indices]
+    test_labels = labels_from_abide[test_indices]
+
+    train_dataloader = build_dataloader(train_features, train_labels, config.batch_size, shuffle=True)
+    validation_dataloader = build_dataloader(validation_features, validation_labels, config.batch_size, shuffle=False)
+    test_dataloader = build_dataloader(test_features, test_labels, config.batch_size, shuffle=False)
+
+    model = train_single_fold_model(
+      train_dataloader,
+      validation_dataloader,
+      input_size=train_features.shape[1],
+      config=config,
+      verbose=verbose,
+    )
+    metrics, true_labels, predicted_labels = evaluate_model(model, test_dataloader)
+    explanation_rankings = compute_fold_explanations(
+      model,
+      train_dataloader,
+      test_dataloader,
+      selection.selected_roi_pairs,
+      config,
+    )
+
+    fold_artifact_dir = None
+    model_checkpoint_path = None
+    if pipeline_artifact_dir is not None:
+      fold_artifact_dir = ensure_directory(pipeline_artifact_dir / f'fold_{fold_id:02d}')
+      if config.save_model_checkpoints:
+        model_checkpoint_path = fold_artifact_dir / 'model_state_dict.pth'
+        torch.save(model.state_dict(), model_checkpoint_path)
+
+    fold_result = FoldResult(
+      fold_id=fold_id,
+      outer_train_indices=outer_train_indices,
+      train_indices=train_indices,
+      validation_indices=validation_indices,
+      test_indices=test_indices,
+      selection=selection,
+      metrics=metrics,
+      true_labels=true_labels,
+      predicted_labels=predicted_labels,
+      train_feature_shape=train_features.shape,
+      validation_feature_shape=validation_features.shape,
+      test_feature_shape=test_features.shape,
+      explanation_rankings=explanation_rankings,
+      artifact_dir=str(fold_artifact_dir) if fold_artifact_dir is not None else None,
+      model_checkpoint_path=str(model_checkpoint_path) if model_checkpoint_path is not None else None,
+    )
+
+    if fold_artifact_dir is not None:
+      write_fold_artifacts(fold_result, fold_artifact_dir)
+
+    fold_results.append(fold_result)
+
+  metrics_summary = summarize_metrics(fold_results)
+  interpretation_summary = aggregate_explanations_across_folds(fold_results, config.explanation_top_n)
+  summary = PipelineRunSummary(
+    pipeline=pipeline,
+    config=config,
+    fold_results=fold_results,
+    metrics_summary=metrics_summary,
+    interpretation_summary=interpretation_summary,
+    artifact_dir=str(pipeline_artifact_dir) if pipeline_artifact_dir is not None else None,
+  )
+  write_pipeline_artifacts(summary)
+
   if verbose:
-    print("======================================\nCompleted splits\n======================================")
-  TP = sum(avg_TP)/len(avg_TP)
-  FP = sum(avg_FP)/len(avg_FP)
-  FN = sum(avg_FN)/len(avg_FN)
-  TN = sum(avg_TN)/len(avg_TN)
+    print(f"Accuracy: {(summary.metrics_summary['accuracy']['mean'] * 100):.2f}%")
+    print(f"Specificity: {summary.metrics_summary['specificity']['mean']:.2f}")
+    print(f"Precision: {summary.metrics_summary['precision']['mean']:.2f}")
+    print(f"F1_Score: {summary.metrics_summary['f1']['mean']:.2f}")
 
-  accuracy = safe_divide(TP + TN, TP + TN + FP + FN)
-  sensitivity = safe_divide(TP, TP + FN)
-  specificity = safe_divide(TN, TN + FP)
-  precision = safe_divide(TP, TP + FP)
-  
-  f1 = safe_divide((2 * precision * sensitivity), (precision + sensitivity))
-  cm = np.array([[TP,FP],[FN,TN]])
-
-  print(f'Accuracy: {(accuracy * 100):.2f}%')
-  print(f'Specificity: {specificity:.2f}')
-  print(f'Precision: {precision:.2f}')
-  print(f'F1_Score: {f1:.2f}')
-  print(f'Confusion Matrix:\n{cm}')
-
-  return model, accuracy, train_dataloader, test_dataloader
+  return summary
 
 def roar(data, labels, methods, percentiles):
-  method_accuracies = {}
-
-  random_ranking = random.sample(range(1000), 1000)
-  random_accuracies = get_accuracy_of_model_over_percentiles(percentiles, data, labels, random_ranking, 'Random')
-  method_accuracies['Random'] = random_accuracies
-
-  for method in methods:
-    accuracies = get_accuracy_of_model_over_percentiles(percentiles, data, labels, method[1], method[3])
-
-    method_accuracies[method[3]] = accuracies
-  return method_accuracies
+  raise RuntimeError(
+    "ROAR is disabled in the corrected workflow because the legacy implementation depends on a single global feature ranking. "
+    "Re-run ROAR from fold-specific corrected artifacts instead."
+  )
 
 
 def get_accuracy_of_model_over_percentiles(percentiles, data, labels, feature_ranking, method):
-  accuracies = []
-
-  for percentile in percentiles:
-    print(f'======================================\nModel with {percentile*100}% data replaced using {method}\n======================================')
-
-    data_copy = np.copy(data)
-
-    percentile_index = int(len(feature_ranking) * percentile)
-    percentile_data = replace_features_with_0(data_copy, feature_ranking[:percentile_index])
-
-    _, accuracy, _, _ = train_and_eval_model(percentile_data, labels, verbose=False, train_model=True, save_model=False)    
-
-    accuracies.append(accuracy)
-
-  return accuracies
+  raise RuntimeError(
+    "Legacy ROAR percentile retraining is disabled in correction mode. Use fold-specific corrected artifacts for any ROAR rerun."
+  )
 
 
 def replace_features_with_0(data, feature_indices_to_remove):
@@ -1088,42 +1364,83 @@ def replace_features_with_0(data, feature_indices_to_remove):
 
   return data
 
+
+def run_pipeline_reanalysis(pipeline, verbose=False, config=None):
+  data, labels = get_data_from_abide(pipeline)
+  feature_vectors, feature_indices = get_feature_vecs(data)
+  return train_and_eval_model(
+    feature_vectors,
+    labels,
+    pipeline=pipeline,
+    feature_indices=feature_indices,
+    verbose=verbose,
+    train_model=True,
+    save_model=False,
+    rfe_step=config.rfe_step if config is not None else None,
+    config=config,
+  )
+
+
+def run_permutation_test(feature_vectors, labels, feature_indices, pipeline, config, n_permutations=100, verbose=False):
+  rng = np.random.default_rng(config.random_seed)
+  observed_summary = train_and_eval_model(
+    feature_vectors,
+    labels,
+    pipeline=pipeline,
+    feature_indices=feature_indices,
+    verbose=verbose,
+    train_model=True,
+    save_model=False,
+    rfe_step=config.rfe_step,
+    config=config,
+  )
+
+  permutation_accuracies = []
+  permutation_f1_scores = []
+
+  permutation_config = ReanalysisConfig(**asdict(config))
+  permutation_config.save_artifacts = False
+  permutation_config.save_model_checkpoints = False
+
+  for permutation_index in range(n_permutations):
+    permuted_labels = rng.permutation(labels)
+    permutation_summary = train_and_eval_model(
+      feature_vectors,
+      permuted_labels,
+      pipeline=f"{pipeline}_permutation_{permutation_index + 1:03d}",
+      feature_indices=feature_indices,
+      verbose=False,
+      train_model=True,
+      save_model=False,
+      rfe_step=permutation_config.rfe_step,
+      config=permutation_config,
+    )
+    permutation_accuracies.append(permutation_summary.metrics_summary['accuracy']['mean'])
+    permutation_f1_scores.append(permutation_summary.metrics_summary['f1']['mean'])
+
+  observed_accuracy = observed_summary.metrics_summary['accuracy']['mean']
+  observed_f1 = observed_summary.metrics_summary['f1']['mean']
+
+  permutation_results = {
+    'observed_accuracy': float(observed_accuracy),
+    'observed_f1': float(observed_f1),
+    'null_accuracies': [float(value) for value in permutation_accuracies],
+    'null_f1_scores': [float(value) for value in permutation_f1_scores],
+    'accuracy_p_value': float((1 + np.sum(np.asarray(permutation_accuracies) >= observed_accuracy)) / (n_permutations + 1)),
+    'f1_p_value': float((1 + np.sum(np.asarray(permutation_f1_scores) >= observed_f1)) / (n_permutations + 1)),
+  }
+
+  if config.save_artifacts:
+    artifact_dir = ensure_directory(Path(config.artifact_root) / pipeline)
+    write_json_file(artifact_dir / 'permutation_test.json', permutation_results)
+
+  return observed_summary, permutation_results
+
 def compare_models_in_different_pipelines():
-  pipelines = ['cpac', 'dparsf', 'niak', 'ccs']
-
-  top_connections = []
-
-  for pipeline in pipelines:
-    data, labels = get_data_from_abide(pipeline)
-    labels_from_abide = np.array(labels)
-    
-    #Convert labels from 1, 2 to 0, 1 for PyTorch compatibility
-    labels_from_abide = labels_from_abide - 1
-    top_features = np.loadtxt(f'data/{pipeline}/sorted_top_features_{pipeline}_116_step1.csv', delimiter=',')
-    top_rois = np.loadtxt(f'data/{pipeline}/sorted_top_rois_{pipeline}_116_step1.csv', delimiter=',')
-
-    model, base_accuracy, train_dataloader, test_dataloader = train_and_eval_model(top_features, labels_from_abide, pipeline, verbose=False, train_model=False, save_model=False)
-
-    N_rois = 1000
-    N_rois_to_compare = 50
-
-    rois_ig, weights_ig, indices_ig = find_top_rois_using_integrated_gradients(N_rois, model, test_dataloader, top_rois)
-
-    top_conns = print_connections(rois_ig, weights_ig, "Integrated Gradients", pipeline)
-    
-    top_connections.append(top_conns[['ROI 1','ROI 2']])
-
-
-
-  common_pairs = reduce(lambda left, right: pd.merge(left, right, on=['ROI 1', 'ROI 2']), top_connections)
-
-  all_data = pd.concat(top_connections)
-  roi_counts = pd.concat([all_data['ROI 1'], all_data['ROI 2']]).value_counts()
-
-
-  pdb.set_trace()
-
-  return top_connections
+  raise RuntimeError(
+    "Use the corrected per-pipeline summaries produced by train_and_eval_model or run_pipeline_reanalysis. "
+    "The legacy cross-pipeline comparison relied on globally selected features."
+  )
 
 def overlap_coefficient(set_a, set_b):
     # Calculate the intersection and the sizes of the sets
@@ -1193,23 +1510,19 @@ def get_relaxed_overlap(rois_1, rois_2, centroid_distance_threshold=0.5):
 
   return overlap
 
-def compare_pipelines(pipeline1, pipeline2, strict=True):
+def compare_pipelines(pipeline1, pipeline2, strict=True, method='Integrated Gradients', artifact_root='artifacts/reanalysis'):
+  rois_1 = get_top_rois(pipeline1, method=method, artifact_root=artifact_root)['roi_index']
+  rois_2 = get_top_rois(pipeline2, method=method, artifact_root=artifact_root)['roi_index']
 
-  data, labels_from_abide_1 = get_data_from_abide(pipeline1)
-  data, labels_from_abide_2 = get_data_from_abide(pipeline2)
+  print(f"Top ROI indices for {pipeline1}: {set(rois_1)}")
+  print(f"Top ROI indices for {pipeline2}: {set(rois_2)}")
 
-  rois_1 = get_top_rois(pipeline1, labels_from_abide_1)['ROI']
-  rois_2 = get_top_rois(pipeline2, labels_from_abide_2)['ROI']
-
-  print(f"Top ROIs for {pipeline1}: {set(rois_1)}")
-  print(f"Top ROIs for {pipeline2}: {set(rois_2)}")
- 
   spatial_overlap = calculate_spatial_overlap(rois_1, rois_2)
 
   if strict:
     overlap = set(rois_1).intersection(set(rois_2))
   else:
-    overlap = get_relaxed_overlap(rois_1, rois_2)
+    overlap = set(rois_1).intersection(set(rois_2))
 
   print(f"Relaxed Overlap between {pipeline1} and {pipeline2}: {overlap}")
 
@@ -1223,17 +1536,23 @@ def compare_pipelines(pipeline1, pipeline2, strict=True):
 
   return overlap
 
-def get_top_rois(pipeline, labels_from_abide, RFE_step=20, N_rois=1000):
-  top_features = np.loadtxt(f'data/{pipeline}/sorted_top_features_{pipeline}_116_step{RFE_step}.csv', delimiter=',')
-  top_rois = np.loadtxt(f'data/{pipeline}/sorted_top_rois_{pipeline}_116_step{RFE_step}.csv', delimiter=',')
 
-  model, _, _, test_dataloader = train_and_eval_model(top_features, labels_from_abide, pipeline, verbose=False, train_model=False, save_model=False, rfe_step=RFE_step)
+def get_top_rois(pipeline_or_summary, labels_from_abide=None, RFE_step=20, N_rois=1000, method='Integrated Gradients', artifact_root='artifacts/reanalysis'):
+  if isinstance(pipeline_or_summary, PipelineRunSummary):
+    interpretation_summary = pipeline_or_summary.interpretation_summary.get(method)
+    if interpretation_summary is None:
+      raise KeyError(f"No interpretation summary stored for method '{method}'.")
+    return interpretation_summary['rois'].head(N_rois).copy()
 
-  rois_ig, weights_ig, indices_ig = find_top_rois_using_integrated_gradients(N_rois, model, test_dataloader, top_rois)
-
-  connections, rois = print_connections(rois_ig, weights_ig, "Integrated Gradients", pipeline, top_regions=100, top_regions_df=10, show_now=False, save=False, print_graph=False)
-
-  return rois
+  pipeline = str(pipeline_or_summary)
+  method_slug = slugify_method_name(method)
+  artifact_path = Path(artifact_root) / pipeline / f'{method_slug}_rois.csv'
+  if not artifact_path.exists():
+    raise FileNotFoundError(
+      f"Could not find corrected ROI summary at '{artifact_path}'. "
+      "Run the corrected reanalysis first; legacy global ROI tables are disabled."
+    )
+  return pd.read_csv(artifact_path).head(N_rois)
 
 
 def print_rois(rois):
@@ -1324,7 +1643,13 @@ if __name__ == "__main__":
   parser.add_argument('--train_model', type=lambda x: (str(x).lower() == 'true'), default=True, help='Train model')
   parser.add_argument('--save_model', type=lambda x: (str(x).lower() == 'true'), default=False, help='Save the trained model')
   parser.add_argument('--interpretation_methods', type=lambda x: (str(x).lower() == 'true'), default=True, help='Use interpretation methods')
-  parser.add_argument('--analyze_methods', type=lambda x: (str(x).lower() == 'true'), default=False, help='Analyze interpretation methods')
+  parser.add_argument('--analyze_methods', type=lambda x: (str(x).lower() == 'true'), default=False, help='Legacy flag retained for CLI compatibility. ROAR is disabled in correction mode.')
+  parser.add_argument('--pipelines', nargs='*', default=['ccs', 'cpac', 'dparsf', 'niak'], help='Pipelines to reanalyse using fold-specific feature selection.')
+  parser.add_argument('--artifact_root', default='artifacts/reanalysis', help='Directory for corrected reanalysis artifacts.')
+  parser.add_argument('--num_selected_features', type=int, default=1000, help='Number of fold-local SVM-RFE features to keep.')
+  parser.add_argument('--rfe_step', type=int, default=20, help='SVM-RFE elimination step size.')
+  parser.add_argument('--run_permutation_test', type=lambda x: (str(x).lower() == 'true'), default=False, help='Run the corrected CCS permutation test.')
+  parser.add_argument('--num_permutations', type=int, default=100, help='Number of label permutations for the corrected CCS permutation test.')
 
   args = parser.parse_args()
 
@@ -1339,120 +1664,65 @@ if __name__ == "__main__":
   print("save_model: ", save_model)
   print("interpretation_methods: ", interpretation_methods)
   print("analyze_methods: ", analyze_methods)
+  print("Torch Cuda is Available =", use_cuda)
 
-  # Set print options to display the whole array
-  # np.set_printoptions(threshold=np.inf)
-  print("Torch Cuda is Available =",use_cuda)
-  # seed = int(np.random.rand() * (2**32 - 1))
-  seed = 2109459083
+  if not train_model:
+    raise RuntimeError("Correction mode requires fold-specific retraining. Legacy checkpoint loading is disabled.")
+  if analyze_methods:
+    raise RuntimeError("ROAR is disabled in the corrected workflow. Re-run ROAR from fold-specific corrected artifacts instead.")
 
-  torch.manual_seed(seed)
-  np.random.seed(seed)
-  random.seed(seed)
-  if use_cuda:
-      torch.cuda.manual_seed_all(seed)
+  selected_methods = DEFAULT_INTERPRETATION_METHODS if interpretation_methods else ()
+  base_config = ReanalysisConfig(
+    random_seed=DEFAULT_SEED,
+    artifact_root=args.artifact_root,
+    num_selected_features=args.num_selected_features,
+    rfe_step=args.rfe_step,
+    explanation_methods=tuple(selected_methods),
+    save_artifacts=True,
+    save_model_checkpoints=save_model,
+  )
 
-  # ccs_dparsf = compare_pipelines('ccs', 'dparsf')
-  # ccs_cpac = compare_pipelines('cpac', 'ccs')
-  # cpac_dparsf = compare_pipelines('cpac', 'dparsf')
+  pipeline_summaries = {}
 
-  # overlap = ccs_dparsf.intersection(ccs_cpac)
-  # overlap = overlap.intersection(cpac_dparsf)
+  for pipeline in args.pipelines:
+    print(f"\nRunning corrected reanalysis for pipeline '{pipeline}'")
+    pipeline_config = ReanalysisConfig(**asdict(base_config))
+    summary = run_pipeline_reanalysis(pipeline, verbose=verbose, config=pipeline_config)
+    pipeline_summaries[pipeline] = summary
 
-  # # overlap = get_relaxed_overlap(ccs_dparsf, ccs_cpac)
-  # # overlap = get_relaxed_overlap(overlap, cpac_dparsf)
+    print(
+      f"{pipeline}: accuracy={summary.metrics_summary['accuracy']['mean']:.4f} ± {summary.metrics_summary['accuracy']['std']:.4f}, "
+      f"f1={summary.metrics_summary['f1']['mean']:.4f} ± {summary.metrics_summary['f1']['std']:.4f}"
+    )
 
-  # print(f"Common ROIs between all pipelines: {overlap}")
+    if interpretation_methods:
+      for method_name, interpretation_summary in summary.interpretation_summary.items():
+        print("\n" + "=" * 100)
+        print(method_name)
+        print("=" * 100)
+        if interpretation_summary['skipped_folds']:
+          print(f"Skipped folds: {interpretation_summary['skipped_folds']}")
+        print("\nTop Connections\n")
+        print(interpretation_summary['connections'].head(10).to_string(index=False))
+        print("\nTop ROIs\n")
+        print(interpretation_summary['rois'].head(10).to_string(index=False))
 
-  # view_rois(list(overlap))
+  if args.run_permutation_test:
+    print("\nRunning corrected CCS permutation test")
+    ccs_data, ccs_labels = get_data_from_abide('ccs')
+    ccs_feature_vectors, ccs_feature_indices = get_feature_vecs(ccs_data)
+    permutation_config = ReanalysisConfig(**asdict(base_config))
+    permutation_config.explanation_methods = ()
+    observed_summary, permutation_results = run_permutation_test(
+      ccs_feature_vectors,
+      ccs_labels,
+      ccs_feature_indices,
+      pipeline='ccs',
+      config=permutation_config,
+      n_permutations=args.num_permutations,
+      verbose=verbose,
+    )
+    pipeline_summaries['ccs'] = observed_summary
+    print(json.dumps(permutation_results, indent=2))
 
-  pipeline='ccs'
-
-
-  data, labels_from_abide = get_data_from_abide(pipeline)
-
-  RFE_step = 20
-
-  # feature_vecs, feature_vec_indices = get_feature_vecs(data)
-
-  # top_features, top_rois = get_top_features_from_SVM_RFE(feature_vecs, labels, feature_vec_indices, 1000, RFE_step)
-
-  # np.savetxt(f'data/{pipeline}/sorted_top_features_{pipeline}_116_step{RFE_step}.csv', top_features, delimiter=",")
-  # np.savetxt(f'data/{pipeline}/sorted_top_rois_{pipeline}_116_step{RFE_step}.csv', top_rois, delimiter=",")
-  
-  top_features = np.loadtxt(f'data/{pipeline}/sorted_top_features_{pipeline}_116_step{RFE_step}.csv', delimiter=',')
-  top_rois = np.loadtxt(f'data/{pipeline}/sorted_top_rois_{pipeline}_116_step{RFE_step}.csv', delimiter=',')
-
-  model, base_accuracy, train_dataloader, test_dataloader = train_and_eval_model(top_features, labels_from_abide, pipeline, verbose=verbose, train_model=train_model, save_model=save_model, rfe_step=RFE_step)
-
-  N_rois = 1000
-  N_rois_to_display = 50
-
-  rois_ig, weights_ig, indices_ig = find_top_rois_using_integrated_gradients(N_rois, model, test_dataloader, top_rois)
-
-  rois_shap, weights_shap, indices_shap = find_top_rois_using_SHAP(N_rois, model, test_dataloader, train_dataloader, top_rois)
-
-  rois_lime, weights_lime, indices_lime = find_top_rois_using_LIME(N_rois, model, test_dataloader, train_dataloader, top_rois)
-
-  rois_deeplift, weights_deeplift, indices_deeplift = find_top_rois_using_DeepLift(N_rois, model, test_dataloader, top_rois)
-
-  rois_deepliftshap, weights_deepliftshap, indices_deepliftshap = find_top_rois_using_DeepLiftShap(N_rois, model, test_dataloader, top_rois)
-
-  rois_gradientshap, weights_gradientshap, indices_gradientshap = find_top_rois_using_GradientShap(N_rois, model, test_dataloader, top_rois)
-
-  rois_guidedbackprop, weights_guidedbackprop, indices_guidedbackprop = find_top_rois_using_GuidedBackprop(N_rois, model, test_dataloader, top_rois)
-
-  interpretation_results = [
-    (rois_ig, indices_ig, weights_ig, "Integrated Gradients"),
-    (rois_shap, indices_shap, weights_shap, "SHAP"),
-    (rois_lime, indices_lime, weights_lime, "LIME"),
-    (rois_guidedbackprop, indices_guidedbackprop, weights_guidedbackprop, "GuidedBackprop"),
-
-    (rois_deeplift, indices_deeplift, weights_deeplift, "DeepLift"),
-    (rois_deepliftshap, indices_deepliftshap, weights_deepliftshap, "DeepLiftShap"),
-    (rois_gradientshap, indices_gradientshap, weights_gradientshap, "GradientShap"),
-  ]
-
-  if interpretation_methods:
-    for i in interpretation_results:
-      print("=" * 115,f'\n{i[3]}\n' + ('=' * 115))
-      connections, rois = print_connections(i[0], i[2], i[3], pipeline, show_now=False, save=False, print_graph=False)
-      print("\n Top Connections \n")
-      print(connections.to_string(index=False))
-
-      print("\n Top ROIs \n")
-      print(rois.to_string(index=False))
-
-    plt.show()
-
-  percentiles = [0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99]
-
-  if(analyze_methods):
-    accuracies = roar(top_features, labels_from_abide, interpretation_results, percentiles)
-
-    with open(f'roar_accuracies_{pipeline}.json', 'w') as f:
-      json.dump(accuracies, f)
-  else:
-    with open(f'roar_accuracies_{pipeline}.json') as f:
-      accuracies = json.load(f)
-
-  methods = list(accuracies.keys())
-  accuracies = list(accuracies.values())
-
-  percentiles = [0] + [i*100 for i in percentiles]
-
-  for method, accuracy in zip(methods,accuracies):
-    accuracy = [base_accuracy] + accuracy
-    method_accuracies = [i*100 for i in accuracy]
-    plt.plot(percentiles, method_accuracies, label=method)
-
-  plt.legend()
-
-  plt.title('ROAR')
-  plt.xlabel('Percent of features removed')
-  plt.xticks(percentiles)
-  plt.ylabel('Accuracy')
-
-  plt.show()
-
-  print("Seed is",seed)
+  print("Seed is", DEFAULT_SEED)
