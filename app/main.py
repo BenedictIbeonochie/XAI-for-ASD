@@ -23,9 +23,12 @@ import os
 import pdb
 import seaborn as sns
 from sklearn.svm import SVC
-from sklearn.feature_selection import RFE
+from sklearn.feature_selection import RFE, f_classif, mutual_info_classif
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import LinearSVC
+from sklearn.ensemble import HistGradientBoostingClassifier
 from captum.attr import IntegratedGradients, DeepLiftShap, DeepLift, GradientShap, ShapleyValueSampling, ShapleyValues, FeatureAblation, GuidedBackprop, Occlusion
 from nilearn import datasets, plotting
 import networkx as nx
@@ -54,8 +57,34 @@ DEFAULT_INTERPRETATION_METHODS = (
   "DeepLiftShap",
   "GradientShap",
 )
+DEFAULT_CONFOUND_VARIABLES = (
+  "site",
+  "age",
+  "sex",
+)
 
-def get_data_from_abide(pipeline):
+
+def parse_optional_float(value):
+  if value is None or pd.isna(value):
+    return None
+
+  value = str(value).strip()
+  if not value:
+    return None
+
+  try:
+    return float(value)
+  except ValueError:
+    return None
+
+
+def load_phenotype_table(pheno_file='data/Phenotypic_V1_0b_preprocessed1.csv'):
+  phenotype = pd.read_csv(pheno_file, low_memory=False)
+  phenotype['FILE_ID'] = phenotype['FILE_ID'].astype(str).str.strip()
+  phenotype = phenotype.loc[phenotype['FILE_ID'] != ''].drop_duplicates(subset='FILE_ID', keep='first')
+  return phenotype.set_index('FILE_ID', drop=False)
+
+def get_data_from_abide(pipeline, return_subject_metadata=False):
   downloads = f'abide/downloads/Outputs/{pipeline}/filt_global/rois_aal/'
   pheno_file = 'data/Phenotypic_V1_0b_preprocessed1.csv'
 
@@ -65,18 +94,11 @@ def get_data_from_abide(pipeline):
       "The corrected reanalysis requires the original subject-level ROI files rather than the legacy globally selected feature CSVs."
     )
 
-  with open(pheno_file, 'r', encoding='utf-8') as phenotypic_file:
-    pheno_list = phenotypic_file.readlines()
-
-  labels_dict = {}
-  for i in pheno_list[1:]:
-    file_name = i.split(',')[6]
-    diagnosis = i.split(',')[7]
-
-    labels_dict[file_name] = float(diagnosis) # Save labels alongisde their filenames
+  phenotype = load_phenotype_table(pheno_file)
 
   data = []
   labels = []
+  subject_metadata = []
 
   for filename in sorted(os.listdir(downloads)):
     if filename.endswith('.1D'):  # Check if the file is a .1D file
@@ -85,9 +107,22 @@ def get_data_from_abide(pipeline):
       data.append(dataset)  # Append the dataset to the list
 
       file_id = '_'.join(filename.split('_')[:-2]) # Get file ID from filename
-      labels.append(labels_dict[file_id])
+      if file_id not in phenotype.index:
+        raise KeyError(file_id)
+
+      row = phenotype.loc[file_id]
+      labels.append(float(row['DX_GROUP']))
+      subject_metadata.append({
+        'file_id': file_id,
+        'site_id': str(row.get('SITE_ID', '')).strip(),
+        'age_at_scan': parse_optional_float(row.get('AGE_AT_SCAN')),
+        'sex': parse_optional_float(row.get('SEX')),
+      })
 
   labels = np.array(labels) - 1
+
+  if return_subject_metadata:
+    return data, labels, pd.DataFrame(subject_metadata)
 
   return data, labels
  
@@ -122,12 +157,51 @@ def get_feature_vecs(data):
 
   return feature_vecs, feature_indices
 
-def get_top_features_from_SVM_RFE(X, Y, indices, N, step, training_sample_indices=None):
+def get_top_features_from_selector(
+  X,
+  Y,
+  indices,
+  N,
+  step,
+  selector_type='rfe',
+  training_sample_indices=None,
+  random_seed=DEFAULT_SEED,
+  logistic_c=1.0,
+):
   roi_lookup = prepare_feature_index_lookup(indices)
-  svm = SVC(kernel="linear")
-  rfe = RFE(estimator=svm, n_features_to_select=N, step=step, verbose=0)
-  rfe.fit(X, Y)
-  top_indices = np.where(rfe.support_)[0]
+  selector_key = str(selector_type).strip().lower()
+  N = min(int(N), X.shape[1])
+
+  if selector_key == 'rfe':
+    estimator = SVC(kernel="linear")
+    selector = RFE(estimator=estimator, n_features_to_select=N, step=step, verbose=0)
+    selector.fit(X, Y)
+    top_indices = np.where(selector.support_)[0]
+  else:
+    if selector_key == 'anova_f':
+      scores, _ = f_classif(X, Y)
+    elif selector_key == 'mutual_info':
+      scores = mutual_info_classif(X, Y, random_state=random_seed)
+    elif selector_key == 'logistic_l1':
+      selector_model = LogisticRegression(
+        penalty='l1',
+        solver='saga',
+        C=logistic_c,
+        max_iter=5000,
+        random_state=random_seed,
+      )
+      selector_model.fit(X, Y)
+      scores = np.max(np.abs(selector_model.coef_), axis=0)
+    else:
+      raise ValueError(
+        f"Unknown selector_type '{selector_type}'. "
+        "Supported options: rfe, anova_f, mutual_info, logistic_l1."
+      )
+
+    scores = np.nan_to_num(np.asarray(scores, dtype=float), nan=-np.inf, posinf=np.finfo(float).max, neginf=-np.inf)
+    top_indices = np.argsort(scores)[-N:]
+
+  top_indices = np.sort(np.asarray(top_indices, dtype=int))
   top_rois = roi_lookup[top_indices].astype(int)
 
   if training_sample_indices is None:
@@ -137,6 +211,18 @@ def get_top_features_from_SVM_RFE(X, Y, indices, N, step, training_sample_indice
     selected_feature_indices=np.asarray(top_indices, dtype=int),
     selected_roi_pairs=np.asarray(top_rois, dtype=int),
     training_sample_indices=np.asarray(training_sample_indices, dtype=int),
+  )
+
+
+def get_top_features_from_SVM_RFE(X, Y, indices, N, step, training_sample_indices=None):
+  return get_top_features_from_selector(
+    X,
+    Y,
+    indices,
+    N,
+    step,
+    selector_type='rfe',
+    training_sample_indices=training_sample_indices,
   )
 
 
@@ -168,6 +254,8 @@ class ReanalysisConfig:
   num_selected_features: int = 1000
   feature_count_candidates: tuple[int, ...] = ()
   feature_count_selection_metric: str = "f1"
+  selector_type: str = "rfe"
+  model_type: str = "ssae"
   rfe_step: int = 20
   validation_size: float = 0.2
   batch_size: int = 128
@@ -181,6 +269,18 @@ class ReanalysisConfig:
   classifier_learning_rate: float = 0.001
   fine_tuning_learning_rate: float = 0.0001
   weight_decay: float = 1e-4
+  ae_scheduler_type: str = "none"
+  supervised_scheduler_type: str = "none"
+  scheduler_patience: int = 5
+  scheduler_factor: float = 0.5
+  svm_c: float = 1.0
+  logistic_c: float = 1.0
+  elastic_net_l1_ratio: float = 0.5
+  hist_gradient_learning_rate: float = 0.1
+  hist_gradient_max_depth: int | None = 3
+  hist_gradient_max_iter: int = 200
+  enable_confound_regression: bool = False
+  confound_variables: tuple[str, ...] = DEFAULT_CONFOUND_VARIABLES
   random_seed: int = DEFAULT_SEED
   ae1_hidden_size: int | None = 500
   ae2_hidden_size: int | None = 100
@@ -229,6 +329,7 @@ class FoldResult:
   scaler_scale: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=float))
   feature_count_tuning_records: list[dict[str, Any]] = field(default_factory=list)
   training_summary: dict[str, Any] = field(default_factory=dict)
+  confound_summary: dict[str, Any] = field(default_factory=dict)
   explanation_rankings: dict[str, ExplanationRanking] = field(default_factory=dict)
   artifact_dir: str | None = None
   model_checkpoint_path: str | None = None
@@ -347,6 +448,181 @@ def sanitize_feature_matrix(features):
 
 def apply_feature_selection(features, selection):
   return sanitize_feature_matrix(features)[:, selection.selected_feature_indices]
+
+
+def normalize_model_type(model_type):
+  return str(model_type).strip().lower()
+
+
+def normalize_selector_type(selector_type):
+  return str(selector_type).strip().lower()
+
+
+def normalize_confound_variables(confound_variables):
+  normalized_variables = []
+  for variable in confound_variables or ():
+    variable = str(variable).strip().lower()
+    if variable in {'site', 'age', 'sex'} and variable not in normalized_variables:
+      normalized_variables.append(variable)
+  return tuple(normalized_variables)
+
+
+def prepare_subject_metadata(subject_metadata):
+  if subject_metadata is None:
+    raise ValueError("subject_metadata is required when confound regression is enabled.")
+
+  if isinstance(subject_metadata, pd.DataFrame):
+    metadata = subject_metadata.copy()
+  else:
+    metadata = pd.DataFrame(subject_metadata)
+
+  for required_column in ('file_id', 'site_id', 'age_at_scan', 'sex'):
+    if required_column not in metadata.columns:
+      metadata[required_column] = None
+
+  return metadata.reset_index(drop=True)
+
+
+def build_confound_design_matrix(
+  subject_metadata,
+  confound_variables,
+  site_categories=None,
+  age_mean=None,
+  age_scale=None,
+  sex_mean=None,
+  sex_scale=None,
+):
+  metadata = prepare_subject_metadata(subject_metadata)
+  confound_variables = normalize_confound_variables(confound_variables)
+  num_samples = len(metadata)
+
+  columns = [np.ones((num_samples, 1), dtype=float)]
+  column_names = ['intercept']
+
+  age_values = pd.to_numeric(metadata['age_at_scan'], errors='coerce').to_numpy(dtype=float)
+  sex_values = pd.to_numeric(metadata['sex'], errors='coerce').to_numpy(dtype=float)
+  site_values = metadata['site_id'].fillna('').astype(str).to_numpy()
+
+  summary = {
+    'variables': list(confound_variables),
+    'site_categories': [],
+    'age_mean': None,
+    'age_scale': None,
+    'sex_mean': None,
+    'sex_scale': None,
+  }
+
+  if 'age' in confound_variables:
+    if age_mean is None:
+      age_mean = float(np.nanmean(age_values)) if not np.all(np.isnan(age_values)) else 0.0
+    if age_scale is None:
+      age_scale = float(np.nanstd(age_values)) if not np.all(np.isnan(age_values)) else 1.0
+    if age_scale == 0:
+      age_scale = 1.0
+
+    age_filled = np.where(np.isnan(age_values), age_mean, age_values)
+    columns.append(((age_filled - age_mean) / age_scale).reshape(-1, 1))
+    column_names.append('age_at_scan')
+    summary['age_mean'] = float(age_mean)
+    summary['age_scale'] = float(age_scale)
+
+  if 'sex' in confound_variables:
+    if sex_mean is None:
+      sex_mean = float(np.nanmean(sex_values)) if not np.all(np.isnan(sex_values)) else 0.0
+    if sex_scale is None:
+      sex_scale = float(np.nanstd(sex_values)) if not np.all(np.isnan(sex_values)) else 1.0
+    if sex_scale == 0:
+      sex_scale = 1.0
+
+    sex_filled = np.where(np.isnan(sex_values), sex_mean, sex_values)
+    columns.append(((sex_filled - sex_mean) / sex_scale).reshape(-1, 1))
+    column_names.append('sex')
+    summary['sex_mean'] = float(sex_mean)
+    summary['sex_scale'] = float(sex_scale)
+
+  if 'site' in confound_variables:
+    if site_categories is None:
+      site_categories = tuple(
+        sorted({
+          site
+          for site in site_values
+          if site
+        })
+      )
+    categorical_sites = pd.Categorical(site_values, categories=site_categories)
+    site_dummies = pd.get_dummies(categorical_sites, prefix='site', dtype=float)
+    if len(site_dummies.columns):
+      columns.append(site_dummies.to_numpy(dtype=float))
+      column_names.extend(site_dummies.columns.tolist())
+    summary['site_categories'] = list(site_categories)
+
+  design_matrix = np.hstack(columns)
+  return design_matrix, column_names, summary
+
+
+def regress_out_confounds(train_features, train_metadata, config, *other_feature_metadata_pairs):
+  train_features = sanitize_feature_matrix(train_features)
+  other_feature_metadata_pairs = [
+    (sanitize_feature_matrix(features), metadata)
+    for features, metadata in other_feature_metadata_pairs
+  ]
+
+  if not config.enable_confound_regression:
+    confound_summary = {
+      'enabled': False,
+      'variables': [],
+      'design_columns': [],
+    }
+    return train_features, [features for features, _ in other_feature_metadata_pairs], confound_summary
+
+  confound_variables = normalize_confound_variables(config.confound_variables)
+  if not confound_variables:
+    confound_summary = {
+      'enabled': False,
+      'variables': [],
+      'design_columns': [],
+    }
+    return train_features, [features for features, _ in other_feature_metadata_pairs], confound_summary
+
+  train_metadata = prepare_subject_metadata(train_metadata)
+  train_design, column_names, train_summary = build_confound_design_matrix(
+    train_metadata,
+    confound_variables,
+  )
+
+  other_design_matrices = []
+  for _, other_metadata in other_feature_metadata_pairs:
+    design_matrix, _, _ = build_confound_design_matrix(
+      other_metadata,
+      confound_variables,
+      site_categories=tuple(train_summary['site_categories']),
+      age_mean=train_summary['age_mean'],
+      age_scale=train_summary['age_scale'],
+      sex_mean=train_summary['sex_mean'],
+      sex_scale=train_summary['sex_scale'],
+    )
+    other_design_matrices.append(design_matrix)
+
+  beta = np.linalg.pinv(train_design) @ train_features
+  residualized_train = train_features - train_design @ beta
+  residualized_others = [
+    features - design_matrix @ beta
+    for (features, _), design_matrix in zip(other_feature_metadata_pairs, other_design_matrices)
+  ]
+
+  confound_summary = {
+    'enabled': True,
+    'variables': list(confound_variables),
+    'design_columns': column_names,
+    'site_categories': train_summary['site_categories'],
+    'age_mean': train_summary['age_mean'],
+    'age_scale': train_summary['age_scale'],
+    'sex_mean': train_summary['sex_mean'],
+    'sex_scale': train_summary['sex_scale'],
+    'beta_shape': list(beta.shape),
+  }
+
+  return residualized_train, residualized_others, confound_summary
 
 
 def get_candidate_feature_counts(config, max_feature_count):
@@ -519,8 +795,122 @@ def compute_average_loss(model, dataloader, criterion):
   return total_loss / total_samples
 
 
-def train_supervised_stage(model, train_dataloader, val_dataloader, criterion, optimizer, max_epochs, patience, min_delta, stage_name, verbose=False):
+def build_scheduler(optimizer, scheduler_type, max_epochs, patience, factor):
+  scheduler_type = str(scheduler_type).strip().lower()
+  if scheduler_type == 'cosine':
+    return optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, max_epochs))
+  if scheduler_type == 'plateau':
+    return optim.lr_scheduler.ReduceLROnPlateau(
+      optimizer,
+      mode='min',
+      factor=factor,
+      patience=max(1, patience),
+    )
+  return None
+
+
+def step_scheduler(scheduler, scheduler_type, metric_value):
+  if scheduler is None:
+    return
+
+  scheduler_type = str(scheduler_type).strip().lower()
+  if scheduler_type == 'plateau':
+    scheduler.step(metric_value)
+  else:
+    scheduler.step()
+
+
+def compute_autoencoder_average_loss(model, dataloader):
   model = model.to(device)
+  model.eval()
+  total_loss = 0.0
+  total_samples = 0
+
+  with torch.no_grad():
+    for data, _ in dataloader:
+      data = data.float().to(device)
+      _, _, loss = model(data)
+      batch_size = data.shape[0]
+      total_loss += float(loss.item()) * batch_size
+      total_samples += batch_size
+
+  if total_samples == 0:
+    return float('inf')
+
+  return total_loss / total_samples
+
+
+def train_autoencoder_stage(model, train_dataloader, val_dataloader, optimizer, max_epochs, patience, min_delta, stage_name, scheduler_type='none', scheduler_patience=5, scheduler_factor=0.5, verbose=False):
+  model = model.to(device)
+  scheduler = build_scheduler(optimizer, scheduler_type, max_epochs, scheduler_patience, scheduler_factor)
+  best_state = clone_module_state(model)
+  best_val_loss = float('inf')
+  best_epoch = 0
+  epochs_without_improvement = 0
+  history = []
+
+  for epoch in range(max_epochs):
+    model.train()
+    total_train_loss = 0.0
+    total_train_samples = 0
+
+    for data, labels in train_dataloader:
+      data = data.float().to(device)
+      labels = labels.long().to(device)
+      optimizer.zero_grad()
+      _, _, loss = model(data)
+      loss.backward()
+      optimizer.step()
+
+      batch_size = data.shape[0]
+      total_train_loss += float(loss.item()) * batch_size
+      total_train_samples += batch_size
+
+    average_train_loss = safe_divide(total_train_loss, total_train_samples)
+    val_loss = compute_autoencoder_average_loss(model, val_dataloader)
+    improved = val_loss < (best_val_loss - min_delta)
+
+    history.append({
+      'epoch': epoch + 1,
+      'train_loss': float(average_train_loss),
+      'validation_loss': float(val_loss),
+      'improved': bool(improved),
+    })
+
+    if improved:
+      best_val_loss = val_loss
+      best_epoch = epoch + 1
+      best_state = clone_module_state(model)
+      epochs_without_improvement = 0
+    else:
+      epochs_without_improvement += 1
+
+    if verbose:
+      print(
+        f"{stage_name} epoch {epoch + 1}/{max_epochs} "
+        f"train_loss={average_train_loss:.6f} val_loss={val_loss:.6f}"
+      )
+
+    step_scheduler(scheduler, scheduler_type, val_loss)
+
+    if patience and epochs_without_improvement >= patience:
+      break
+
+  model.load_state_dict(best_state)
+
+  return {
+    'stage_name': stage_name,
+    'scheduler_type': str(scheduler_type).strip().lower(),
+    'epochs_trained': len(history),
+    'best_epoch': best_epoch,
+    'best_validation_loss': float(best_val_loss),
+    'history': history,
+  }
+
+
+def train_supervised_stage(model, train_dataloader, val_dataloader, criterion, optimizer, max_epochs, patience, min_delta, stage_name, scheduler_type='none', scheduler_patience=5, scheduler_factor=0.5, verbose=False):
+  model = model.to(device)
+  scheduler = build_scheduler(optimizer, scheduler_type, max_epochs, scheduler_patience, scheduler_factor)
   best_state = clone_module_state(model)
   best_val_loss = float('inf')
   best_epoch = 0
@@ -570,6 +960,8 @@ def train_supervised_stage(model, train_dataloader, val_dataloader, criterion, o
         f"train_loss={average_train_loss:.6f} val_loss={val_loss:.6f}"
       )
 
+    step_scheduler(scheduler, scheduler_type, val_loss)
+
     if patience and epochs_without_improvement >= patience:
       break
 
@@ -577,6 +969,7 @@ def train_supervised_stage(model, train_dataloader, val_dataloader, criterion, o
 
   return {
     'stage_name': stage_name,
+    'scheduler_type': str(scheduler_type).strip().lower(),
     'epochs_trained': len(history),
     'best_epoch': best_epoch,
     'best_validation_loss': float(best_val_loss),
@@ -1154,21 +1547,22 @@ def train_single_fold_model(train_dataloader, val_dataloader, input_size, config
   optimizer_classifier = optim.Adam(classifier.parameters(), lr=config.classifier_learning_rate, weight_decay=config.weight_decay)
   optimizer_model = optim.Adam(model.parameters(), lr=config.fine_tuning_learning_rate, weight_decay=config.weight_decay)
   classifier_criterion = nn.CrossEntropyLoss()
-  training_summary = {
-    'ae1': {'epochs_trained': config.ae1_epochs},
-    'ae2': {'epochs_trained': config.ae2_epochs},
-  }
+  training_summary = {}
 
-  for epoch in range(config.ae1_epochs):
-    for data, _ in train_dataloader:
-      data = data.float().to(device)
-      optimizer_ae1.zero_grad()
-      _, _, loss = ae1(data)
-      loss.backward()
-      optimizer_ae1.step()
-
-    if verbose:
-      print(f"AE1 epoch {epoch + 1}/{config.ae1_epochs} loss={loss.item():.6f}")
+  training_summary['ae1'] = train_autoencoder_stage(
+    ae1,
+    train_dataloader,
+    val_dataloader,
+    optimizer_ae1,
+    config.ae1_epochs,
+    config.early_stopping_patience,
+    config.early_stopping_min_delta,
+    "AE1",
+    scheduler_type=config.ae_scheduler_type,
+    scheduler_patience=config.scheduler_patience,
+    scheduler_factor=config.scheduler_factor,
+    verbose=verbose,
+  )
 
   encoded_train_dataset, encoded_train_loader = get_encoded_data(
     ae1,
@@ -1183,16 +1577,20 @@ def train_single_fold_model(train_dataloader, val_dataloader, input_size, config
     device,
   )
 
-  for epoch in range(config.ae2_epochs):
-    for data, _ in encoded_train_loader:
-      data = data.float().to(device)
-      optimizer_ae2.zero_grad()
-      _, _, loss = ae2(data)
-      loss.backward()
-      optimizer_ae2.step()
-
-    if verbose:
-      print(f"AE2 epoch {epoch + 1}/{config.ae2_epochs} loss={loss.item():.6f}")
+  training_summary['ae2'] = train_autoencoder_stage(
+    ae2,
+    encoded_train_loader,
+    encoded_val_loader,
+    optimizer_ae2,
+    config.ae2_epochs,
+    config.early_stopping_patience,
+    config.early_stopping_min_delta,
+    "AE2",
+    scheduler_type=config.ae_scheduler_type,
+    scheduler_patience=config.scheduler_patience,
+    scheduler_factor=config.scheduler_factor,
+    verbose=verbose,
+  )
 
   _, encoded_classifier_train_loader = get_encoded_data(
     ae2,
@@ -1217,6 +1615,9 @@ def train_single_fold_model(train_dataloader, val_dataloader, input_size, config
     config.early_stopping_patience,
     config.early_stopping_min_delta,
     "Classifier",
+    scheduler_type=config.supervised_scheduler_type,
+    scheduler_patience=config.scheduler_patience,
+    scheduler_factor=config.scheduler_factor,
     verbose=verbose,
   )
 
@@ -1230,13 +1631,108 @@ def train_single_fold_model(train_dataloader, val_dataloader, input_size, config
     config.early_stopping_patience,
     config.early_stopping_min_delta,
     "Fine-tuning",
+    scheduler_type=config.supervised_scheduler_type,
+    scheduler_patience=config.scheduler_patience,
+    scheduler_factor=config.scheduler_factor,
     verbose=verbose,
   )
 
   return model, training_summary
 
 
-def evaluate_model(model, test_dataloader):
+def train_baseline_model(train_features, train_labels, validation_features, validation_labels, config, verbose=False):
+  model_type = normalize_model_type(config.model_type)
+
+  if model_type == 'linear_svm':
+    model = LinearSVC(
+      C=config.svm_c,
+      dual='auto',
+      max_iter=5000,
+      random_state=config.random_seed,
+    )
+  elif model_type == 'logistic_l1':
+    model = LogisticRegression(
+      penalty='l1',
+      solver='saga',
+      C=config.logistic_c,
+      max_iter=5000,
+      random_state=config.random_seed,
+    )
+  elif model_type == 'logistic_elastic_net':
+    model = LogisticRegression(
+      penalty='elasticnet',
+      solver='saga',
+      C=config.logistic_c,
+      l1_ratio=config.elastic_net_l1_ratio,
+      max_iter=5000,
+      random_state=config.random_seed,
+    )
+  elif model_type == 'hist_gradient_boosting':
+    model = HistGradientBoostingClassifier(
+      learning_rate=config.hist_gradient_learning_rate,
+      max_depth=config.hist_gradient_max_depth,
+      max_iter=config.hist_gradient_max_iter,
+      random_state=config.random_seed,
+      early_stopping=False,
+    )
+  else:
+    raise ValueError(
+      f"Unknown model_type '{config.model_type}'. "
+      "Supported options: ssae, linear_svm, logistic_l1, logistic_elastic_net, hist_gradient_boosting."
+    )
+
+  model.fit(train_features, train_labels)
+  train_predictions = model.predict(train_features)
+  validation_predictions = model.predict(validation_features)
+
+  training_summary = {
+    'model_type': model_type,
+    'hyperparameters': {
+      'svm_c': float(config.svm_c),
+      'logistic_c': float(config.logistic_c),
+      'elastic_net_l1_ratio': float(config.elastic_net_l1_ratio),
+      'hist_gradient_learning_rate': float(config.hist_gradient_learning_rate),
+      'hist_gradient_max_depth': int(config.hist_gradient_max_depth) if config.hist_gradient_max_depth is not None else None,
+      'hist_gradient_max_iter': int(config.hist_gradient_max_iter),
+    },
+    'train_metrics': compute_binary_metrics(train_labels, train_predictions),
+    'validation_metrics': compute_binary_metrics(validation_labels, validation_predictions),
+  }
+
+  if verbose:
+    print(
+      f"{model_type} validation_accuracy={training_summary['validation_metrics']['accuracy']:.4f} "
+      f"validation_f1={training_summary['validation_metrics']['f1']:.4f}"
+    )
+
+  return model, training_summary
+
+
+def train_fold_model(train_features, train_labels, validation_features, validation_labels, config, verbose=False):
+  model_type = normalize_model_type(config.model_type)
+
+  if model_type == 'ssae':
+    train_dataloader = build_dataloader(train_features, train_labels, config.batch_size, shuffle=True)
+    validation_dataloader = build_dataloader(validation_features, validation_labels, config.batch_size, shuffle=False)
+    return train_single_fold_model(
+      train_dataloader,
+      validation_dataloader,
+      input_size=train_features.shape[1],
+      config=config,
+      verbose=verbose,
+    )
+
+  return train_baseline_model(
+    train_features,
+    train_labels,
+    validation_features,
+    validation_labels,
+    config,
+    verbose=verbose,
+  )
+
+
+def evaluate_torch_model(model, test_dataloader):
   model = model.to(device)
   model.eval()
   true_labels = []
@@ -1258,7 +1754,14 @@ def evaluate_model(model, test_dataloader):
   return metrics, true_labels, predicted_labels
 
 
-def select_feature_count_for_fold(feature_vectors, labels_from_abide, roi_lookup, train_indices, validation_indices, config, verbose=False):
+def evaluate_sklearn_model(model, test_features, test_labels):
+  true_labels = np.asarray(test_labels, dtype=int)
+  predicted_labels = np.asarray(model.predict(test_features), dtype=int)
+  metrics = compute_binary_metrics(true_labels, predicted_labels)
+  return metrics, true_labels, predicted_labels
+
+
+def select_feature_count_for_fold(feature_vectors, labels_from_abide, roi_lookup, train_indices, validation_indices, config, subject_metadata=None, verbose=False):
   candidate_feature_counts = get_candidate_feature_counts(config, feature_vectors.shape[1])
 
   if len(candidate_feature_counts) == 1:
@@ -1271,18 +1774,30 @@ def select_feature_count_for_fold(feature_vectors, labels_from_abide, roi_lookup
   best_accuracy = float('-inf')
   best_feature_count = candidate_feature_counts[0]
 
+  train_metadata = subject_metadata.iloc[train_indices] if subject_metadata is not None else None
+  validation_metadata = subject_metadata.iloc[validation_indices] if subject_metadata is not None else None
+  candidate_train_base_features, [candidate_validation_base_features], confound_summary = regress_out_confounds(
+    feature_vectors[train_indices],
+    train_metadata,
+    config,
+    (feature_vectors[validation_indices], validation_metadata),
+  )
+
   for feature_count in candidate_feature_counts:
-    candidate_selection = get_top_features_from_SVM_RFE(
-      feature_vectors[train_indices],
+    candidate_selection = get_top_features_from_selector(
+      candidate_train_base_features,
       labels_from_abide[train_indices],
       roi_lookup,
       feature_count,
       config.rfe_step,
+      selector_type=config.selector_type,
       training_sample_indices=train_indices,
+      random_seed=config.random_seed,
+      logistic_c=config.logistic_c,
     )
 
-    candidate_train_features = apply_feature_selection(feature_vectors[train_indices], candidate_selection)
-    candidate_validation_features = apply_feature_selection(feature_vectors[validation_indices], candidate_selection)
+    candidate_train_features = apply_feature_selection(candidate_train_base_features, candidate_selection)
+    candidate_validation_features = apply_feature_selection(candidate_validation_base_features, candidate_selection)
     candidate_train_features, [candidate_validation_features], _ = scale_feature_sets(
       candidate_train_features,
       config,
@@ -1291,17 +1806,19 @@ def select_feature_count_for_fold(feature_vectors, labels_from_abide, roi_lookup
 
     candidate_train_labels = labels_from_abide[train_indices]
     candidate_validation_labels = labels_from_abide[validation_indices]
-    candidate_train_loader = build_dataloader(candidate_train_features, candidate_train_labels, config.batch_size, shuffle=True)
-    candidate_validation_loader = build_dataloader(candidate_validation_features, candidate_validation_labels, config.batch_size, shuffle=False)
-
-    candidate_model, candidate_training_summary = train_single_fold_model(
-      candidate_train_loader,
-      candidate_validation_loader,
-      input_size=candidate_train_features.shape[1],
+    candidate_model, candidate_training_summary = train_fold_model(
+      candidate_train_features,
+      candidate_train_labels,
+      candidate_validation_features,
+      candidate_validation_labels,
       config=config,
       verbose=False,
     )
-    candidate_metrics, _, _ = evaluate_model(candidate_model, candidate_validation_loader)
+    if normalize_model_type(config.model_type) == 'ssae':
+      candidate_validation_loader = build_dataloader(candidate_validation_features, candidate_validation_labels, config.batch_size, shuffle=False)
+      candidate_metrics, _, _ = evaluate_torch_model(candidate_model, candidate_validation_loader)
+    else:
+      candidate_metrics, _, _ = evaluate_sklearn_model(candidate_model, candidate_validation_features, candidate_validation_labels)
     metric_value = float(candidate_metrics[metric_name])
     accuracy_value = float(candidate_metrics['accuracy'])
     tuning_records.append({
@@ -1309,6 +1826,7 @@ def select_feature_count_for_fold(feature_vectors, labels_from_abide, roi_lookup
       'selection_training_sample_indices': np.asarray(train_indices, dtype=int),
       'validation_metrics': candidate_metrics,
       'training_summary': candidate_training_summary,
+      'confound_summary': confound_summary,
     })
 
     if verbose:
@@ -1342,6 +1860,16 @@ def compute_fold_explanations(model, train_dataloader, test_dataloader, selected
   explanation_rankings = {}
   selected_roi_pairs = np.asarray(selected_roi_pairs, dtype=int)
   method_map = get_interpretability_method_map()
+
+  if normalize_model_type(config.model_type) != 'ssae':
+    for method_name in config.explanation_methods:
+      explanation_rankings[method_name] = ExplanationRanking(
+        skipped_reason=(
+          f"Interpretation method '{method_name}' is only implemented for the SSAE model. "
+          f"Current model_type is '{config.model_type}'."
+        ),
+      )
+    return explanation_rankings
 
   for method_name in config.explanation_methods:
     if method_name not in method_map:
@@ -1479,6 +2007,7 @@ def write_fold_artifacts(fold_result, artifact_dir):
     },
   )
   write_json_file(artifact_dir / 'training_summary.json', fold_result.training_summary)
+  write_json_file(artifact_dir / 'confound_regression.json', fold_result.confound_summary)
 
   for method_name, explanation in fold_result.explanation_rankings.items():
     method_slug = slugify_method_name(method_name)
@@ -1527,7 +2056,7 @@ def write_pipeline_artifacts(summary):
   write_json_file(artifact_dir / 'summary.json', summary)
 
 
-def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown', feature_indices=None, verbose=False, train_model=True, save_model=False, rfe_step=None, config=None):
+def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown', feature_indices=None, subject_metadata=None, verbose=False, train_model=True, save_model=False, rfe_step=None, config=None):
   if config is None:
     config = ReanalysisConfig()
 
@@ -1545,6 +2074,8 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
   feature_vectors = sanitize_feature_matrix(feature_vectors)
   labels_from_abide = np.asarray(labels_from_abide, dtype=int)
   roi_lookup = prepare_feature_index_lookup(feature_indices)
+  if subject_metadata is not None:
+    subject_metadata = prepare_subject_metadata(subject_metadata)
 
   if feature_vectors.ndim != 2:
     raise ValueError("feature_vectors must be a 2D array of shape (samples, features).")
@@ -1579,21 +2110,39 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
       train_indices,
       validation_indices,
       config,
+      subject_metadata=subject_metadata,
       verbose=verbose,
     )
 
-    selection = get_top_features_from_SVM_RFE(
+    outer_train_metadata = subject_metadata.iloc[outer_train_indices] if subject_metadata is not None else None
+    train_metadata = subject_metadata.iloc[train_indices] if subject_metadata is not None else None
+    validation_metadata = subject_metadata.iloc[validation_indices] if subject_metadata is not None else None
+    test_metadata = subject_metadata.iloc[test_indices] if subject_metadata is not None else None
+
+    outer_train_selection_features, [train_base_features, validation_base_features, test_base_features], confound_summary = regress_out_confounds(
       feature_vectors[outer_train_indices],
+      outer_train_metadata,
+      config,
+      (feature_vectors[train_indices], train_metadata),
+      (feature_vectors[validation_indices], validation_metadata),
+      (feature_vectors[test_indices], test_metadata),
+    )
+
+    selection = get_top_features_from_selector(
+      outer_train_selection_features,
       labels_from_abide[outer_train_indices],
       roi_lookup,
       selected_feature_count,
       config.rfe_step,
+      selector_type=config.selector_type,
       training_sample_indices=outer_train_indices,
+      random_seed=config.random_seed,
+      logistic_c=config.logistic_c,
     )
 
-    train_features = apply_feature_selection(feature_vectors[train_indices], selection)
-    validation_features = apply_feature_selection(feature_vectors[validation_indices], selection)
-    test_features = apply_feature_selection(feature_vectors[test_indices], selection)
+    train_features = apply_feature_selection(train_base_features, selection)
+    validation_features = apply_feature_selection(validation_base_features, selection)
+    test_features = apply_feature_selection(test_base_features, selection)
     train_features, [validation_features, test_features], scaling_summary = scale_feature_sets(
       train_features,
       config,
@@ -1605,24 +2154,29 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
     validation_labels = labels_from_abide[validation_indices]
     test_labels = labels_from_abide[test_indices]
 
-    train_dataloader = build_dataloader(train_features, train_labels, config.batch_size, shuffle=True)
-    validation_dataloader = build_dataloader(validation_features, validation_labels, config.batch_size, shuffle=False)
-    test_dataloader = build_dataloader(test_features, test_labels, config.batch_size, shuffle=False)
-
     if verbose:
       print(
         f"Fold {fold_id}: selected {selected_feature_count} features "
         f"from {feature_vectors.shape[1]} candidates"
       )
 
-    model, training_summary = train_single_fold_model(
-      train_dataloader,
-      validation_dataloader,
-      input_size=train_features.shape[1],
+    model, training_summary = train_fold_model(
+      train_features,
+      train_labels,
+      validation_features,
+      validation_labels,
       config=config,
       verbose=verbose,
     )
-    metrics, true_labels, predicted_labels = evaluate_model(model, test_dataloader)
+    train_dataloader = None
+    test_dataloader = None
+    if normalize_model_type(config.model_type) == 'ssae':
+      train_dataloader = build_dataloader(train_features, train_labels, config.batch_size, shuffle=True)
+      test_dataloader = build_dataloader(test_features, test_labels, config.batch_size, shuffle=False)
+      metrics, true_labels, predicted_labels = evaluate_torch_model(model, test_dataloader)
+    else:
+      metrics, true_labels, predicted_labels = evaluate_sklearn_model(model, test_features, test_labels)
+
     explanation_rankings = compute_fold_explanations(
       model,
       train_dataloader,
@@ -1635,7 +2189,7 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
     model_checkpoint_path = None
     if pipeline_artifact_dir is not None:
       fold_artifact_dir = ensure_directory(pipeline_artifact_dir / f'fold_{fold_id:02d}')
-      if config.save_model_checkpoints:
+      if config.save_model_checkpoints and hasattr(model, 'state_dict'):
         model_checkpoint_path = fold_artifact_dir / 'model_state_dict.pth'
         torch.save(model.state_dict(), model_checkpoint_path)
 
@@ -1657,6 +2211,7 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
       scaler_scale=np.asarray(scaling_summary['scale'], dtype=float),
       feature_count_tuning_records=feature_count_tuning_records,
       training_summary=training_summary,
+      confound_summary=confound_summary,
       explanation_rankings=explanation_rankings,
       artifact_dir=str(fold_artifact_dir) if fold_artifact_dir is not None else None,
       model_checkpoint_path=str(model_checkpoint_path) if model_checkpoint_path is not None else None,
@@ -1809,6 +2364,9 @@ def run_hyperparameter_sweep(pipeline, base_config, sweep_configs, sweep_root, v
 
     row = {
       'config_name': config_name,
+      'model_type': config.model_type,
+      'selector_type': config.selector_type,
+      'enable_confound_regression': bool(config.enable_confound_regression),
       **sweep_entry['parameters'],
       'accuracy_mean': float(summary.metrics_summary['accuracy']['mean']),
       'accuracy_std': float(summary.metrics_summary['accuracy']['std']),
@@ -1840,13 +2398,14 @@ def run_hyperparameter_sweep(pipeline, base_config, sweep_configs, sweep_root, v
 
 
 def run_pipeline_reanalysis(pipeline, verbose=False, config=None):
-  data, labels = get_data_from_abide(pipeline)
+  data, labels, subject_metadata = get_data_from_abide(pipeline, return_subject_metadata=True)
   feature_vectors, feature_indices = get_feature_vecs(data)
   return train_and_eval_model(
     feature_vectors,
     labels,
     pipeline=pipeline,
     feature_indices=feature_indices,
+    subject_metadata=subject_metadata,
     verbose=verbose,
     train_model=True,
     save_model=False,
@@ -1855,13 +2414,14 @@ def run_pipeline_reanalysis(pipeline, verbose=False, config=None):
   )
 
 
-def run_permutation_test(feature_vectors, labels, feature_indices, pipeline, config, n_permutations=100, verbose=False):
+def run_permutation_test(feature_vectors, labels, feature_indices, pipeline, config, subject_metadata=None, n_permutations=100, verbose=False):
   rng = np.random.default_rng(config.random_seed)
   observed_summary = train_and_eval_model(
     feature_vectors,
     labels,
     pipeline=pipeline,
     feature_indices=feature_indices,
+    subject_metadata=subject_metadata,
     verbose=verbose,
     train_model=True,
     save_model=False,
@@ -1883,6 +2443,7 @@ def run_permutation_test(feature_vectors, labels, feature_indices, pipeline, con
       permuted_labels,
       pipeline=f"{pipeline}_permutation_{permutation_index + 1:03d}",
       feature_indices=feature_indices,
+      subject_metadata=subject_metadata,
       verbose=False,
       train_model=True,
       save_model=False,
@@ -2121,17 +2682,35 @@ if __name__ == "__main__":
   parser.add_argument('--pipelines', nargs='*', default=['ccs', 'cpac', 'dparsf', 'niak'], help='Pipelines to reanalyse using fold-specific feature selection.')
   parser.add_argument('--artifact_root', default='artifacts/reanalysis', help='Directory for corrected reanalysis artifacts.')
   parser.add_argument('--num_selected_features', type=int, default=1000, help='Number of fold-local SVM-RFE features to keep.')
+  parser.add_argument('--selector_type', default='rfe', help='Feature selector to use inside each fold. Options: rfe, anova_f, mutual_info, logistic_l1')
+  parser.add_argument('--model_type', default='ssae', help='Model to train on the selected features. Options: ssae, linear_svm, logistic_l1, logistic_elastic_net, hist_gradient_boosting')
   parser.add_argument('--ae1_hidden_size', type=int, default=500, help='Hidden size for the first autoencoder layer.')
   parser.add_argument('--ae2_hidden_size', type=int, default=100, help='Hidden size for the second autoencoder layer.')
   parser.add_argument('--feature_count_candidates', nargs='*', type=int, default=None, help='Optional feature-count candidates to tune inside each training fold, e.g. --feature_count_candidates 250 500 750 1000')
   parser.add_argument('--feature_count_selection_metric', default='f1', help='Validation metric used to choose feature count. Options: accuracy, sensitivity, specificity, precision, f1')
   parser.add_argument('--rfe_step', type=int, default=20, help='SVM-RFE elimination step size.')
+  parser.add_argument('--ae1_epochs', type=int, default=50, help='Maximum epochs for the first autoencoder pretraining stage.')
+  parser.add_argument('--ae2_epochs', type=int, default=50, help='Maximum epochs for the second autoencoder pretraining stage.')
+  parser.add_argument('--classifier_epochs', type=int, default=300, help='Maximum epochs for the classifier stage.')
+  parser.add_argument('--fine_tuning_epochs', type=int, default=125, help='Maximum epochs for the end-to-end fine-tuning stage.')
   parser.add_argument('--early_stopping_patience', type=int, default=15, help='Number of validation epochs without improvement before stopping classifier/fine-tuning.')
   parser.add_argument('--early_stopping_min_delta', type=float, default=1e-4, help='Minimum validation-loss improvement required to reset early stopping.')
   parser.add_argument('--ae_learning_rate', type=float, default=0.001, help='Learning rate for autoencoder pretraining.')
   parser.add_argument('--classifier_learning_rate', type=float, default=0.001, help='Learning rate for the classifier stage.')
   parser.add_argument('--fine_tuning_learning_rate', type=float, default=0.0001, help='Learning rate for the end-to-end fine-tuning stage.')
   parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay used across the training stages.')
+  parser.add_argument('--ae_scheduler_type', default='none', help='Learning-rate scheduler for autoencoder pretraining. Options: none, cosine, plateau')
+  parser.add_argument('--supervised_scheduler_type', default='none', help='Learning-rate scheduler for classifier/fine-tuning. Options: none, cosine, plateau')
+  parser.add_argument('--scheduler_patience', type=int, default=5, help='Patience for plateau schedulers.')
+  parser.add_argument('--scheduler_factor', type=float, default=0.5, help='Multiplicative factor for plateau schedulers.')
+  parser.add_argument('--enable_confound_regression', type=lambda x: (str(x).lower() == 'true'), default=False, help='Regress out site/age/sex from each feature using training data only inside each fold.')
+  parser.add_argument('--confound_variables', nargs='*', default=list(DEFAULT_CONFOUND_VARIABLES), help='Subset of confounds to regress out when enabled. Options: site, age, sex')
+  parser.add_argument('--svm_c', type=float, default=1.0, help='Regularization strength for the linear SVM baseline.')
+  parser.add_argument('--logistic_c', type=float, default=1.0, help='Inverse regularization strength for logistic baselines and the logistic_l1 selector.')
+  parser.add_argument('--elastic_net_l1_ratio', type=float, default=0.5, help='L1 ratio for the logistic elastic-net baseline.')
+  parser.add_argument('--hist_gradient_learning_rate', type=float, default=0.1, help='Learning rate for the histogram gradient boosting baseline.')
+  parser.add_argument('--hist_gradient_max_depth', type=int, default=3, help='Maximum tree depth for the histogram gradient boosting baseline.')
+  parser.add_argument('--hist_gradient_max_iter', type=int, default=200, help='Maximum number of boosting iterations for the histogram gradient boosting baseline.')
   parser.add_argument('--use_feature_scaling', type=lambda x: (str(x).lower() == 'true'), default=True, help='Scale selected features inside each fold using training data only.')
   parser.add_argument('--run_hyperparameter_sweep', type=lambda x: (str(x).lower() == 'true'), default=False, help='Run a series of fixed, leak-free configurations and save a comparison table.')
   parser.add_argument('--sweep_name', default='hyperparameter_sweep', help='Artifact subdirectory name for the fixed-configuration sweep summary.')
@@ -2161,6 +2740,9 @@ if __name__ == "__main__":
   print("interpretation_methods: ", interpretation_methods)
   print("analyze_methods: ", analyze_methods)
   print("run_hyperparameter_sweep: ", run_hyperparameter_sweep_flag)
+  print("model_type: ", args.model_type)
+  print("selector_type: ", args.selector_type)
+  print("enable_confound_regression: ", args.enable_confound_regression)
   print("Torch Cuda is Available =", use_cuda)
 
   if not train_model:
@@ -2175,6 +2757,12 @@ if __name__ == "__main__":
     random_seed=DEFAULT_SEED,
     artifact_root=args.artifact_root,
     num_selected_features=args.num_selected_features,
+    selector_type=args.selector_type,
+    model_type=args.model_type,
+    ae1_epochs=args.ae1_epochs,
+    ae2_epochs=args.ae2_epochs,
+    classifier_epochs=args.classifier_epochs,
+    fine_tuning_epochs=args.fine_tuning_epochs,
     ae1_hidden_size=args.ae1_hidden_size,
     ae2_hidden_size=args.ae2_hidden_size,
     feature_count_candidates=tuple(args.feature_count_candidates or ()),
@@ -2186,6 +2774,18 @@ if __name__ == "__main__":
     classifier_learning_rate=args.classifier_learning_rate,
     fine_tuning_learning_rate=args.fine_tuning_learning_rate,
     weight_decay=args.weight_decay,
+    ae_scheduler_type=args.ae_scheduler_type,
+    supervised_scheduler_type=args.supervised_scheduler_type,
+    scheduler_patience=args.scheduler_patience,
+    scheduler_factor=args.scheduler_factor,
+    svm_c=args.svm_c,
+    logistic_c=args.logistic_c,
+    elastic_net_l1_ratio=args.elastic_net_l1_ratio,
+    hist_gradient_learning_rate=args.hist_gradient_learning_rate,
+    hist_gradient_max_depth=args.hist_gradient_max_depth,
+    hist_gradient_max_iter=args.hist_gradient_max_iter,
+    enable_confound_regression=args.enable_confound_regression,
+    confound_variables=tuple(args.confound_variables or ()),
     use_feature_scaling=args.use_feature_scaling,
     explanation_methods=tuple(selected_methods),
     save_artifacts=True,
@@ -2257,7 +2857,7 @@ if __name__ == "__main__":
 
   if args.run_permutation_test:
     print("\nRunning corrected CCS permutation test")
-    ccs_data, ccs_labels = get_data_from_abide('ccs')
+    ccs_data, ccs_labels, ccs_subject_metadata = get_data_from_abide('ccs', return_subject_metadata=True)
     ccs_feature_vectors, ccs_feature_indices = get_feature_vecs(ccs_data)
     permutation_config = ReanalysisConfig(**asdict(base_config))
     permutation_config.explanation_methods = ()
@@ -2267,6 +2867,7 @@ if __name__ == "__main__":
       ccs_feature_indices,
       pipeline='ccs',
       config=permutation_config,
+      subject_metadata=ccs_subject_metadata,
       n_permutations=args.num_permutations,
       verbose=verbose,
     )

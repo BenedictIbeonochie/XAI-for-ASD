@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -17,10 +18,12 @@ from app.main import (
     StackedAutoencoder,
     build_hyperparameter_sweep_configs,
     build_dataloader,
+    build_confound_design_matrix,
     coerce_explanation_ranking,
     compute_fold_explanations,
     get_top_features_from_SVM_RFE,
     load_legacy_selected_features,
+    regress_out_confounds,
     train_supervised_stage,
     train_and_eval_model,
 )
@@ -36,6 +39,18 @@ def make_synthetic_feature_matrix(num_samples=30, num_features=12):
     feature_indices = np.array([[index, index + 1] for index in range(num_features)], dtype=int)
 
     return feature_vectors, labels, feature_indices
+
+
+def make_synthetic_subject_metadata(num_samples=30):
+    rows = []
+    for index in range(num_samples):
+        rows.append({
+            "file_id": f"subject_{index:03d}",
+            "site_id": "SITE_A" if index % 2 == 0 else "SITE_B",
+            "age_at_scan": 10.0 + index,
+            "sex": 1.0 if index % 3 == 0 else 2.0,
+        })
+    return pd.DataFrame(rows)
 
 
 class LeakFreeReanalysisTests(unittest.TestCase):
@@ -268,6 +283,105 @@ class LeakFreeReanalysisTests(unittest.TestCase):
                 np.sort(fold_result.selection.training_sample_indices),
                 np.sort(fold_result.outer_train_indices),
             )
+
+    def test_confound_regression_uses_training_subset_only(self):
+        train_features = np.array([
+            [1.0, 2.0],
+            [2.0, 4.0],
+            [3.0, 6.0],
+            [4.0, 8.0],
+        ])
+        test_features = np.array([
+            [5.0, 10.0],
+            [6.0, 12.0],
+        ])
+        train_metadata = pd.DataFrame([
+            {"file_id": "a", "site_id": "SITE_A", "age_at_scan": 10.0, "sex": 1.0},
+            {"file_id": "b", "site_id": "SITE_A", "age_at_scan": 11.0, "sex": 2.0},
+            {"file_id": "c", "site_id": "SITE_B", "age_at_scan": 12.0, "sex": 1.0},
+            {"file_id": "d", "site_id": "SITE_B", "age_at_scan": 13.0, "sex": 2.0},
+        ])
+        test_metadata = pd.DataFrame([
+            {"file_id": "e", "site_id": "SITE_A", "age_at_scan": 14.0, "sex": 1.0},
+            {"file_id": "f", "site_id": "SITE_B", "age_at_scan": 15.0, "sex": 2.0},
+        ])
+        config = self.make_fast_config(
+            "artifacts/test",
+            enable_confound_regression=True,
+            confound_variables=("site", "age", "sex"),
+        )
+
+        residual_train, [residual_test], summary = regress_out_confounds(
+            train_features,
+            train_metadata,
+            config,
+            (test_features, test_metadata),
+        )
+
+        train_design, _, _ = build_confound_design_matrix(train_metadata, ("site", "age", "sex"))
+        expected_beta = np.linalg.pinv(train_design) @ train_features
+        expected_train = train_features - train_design @ expected_beta
+
+        test_design, _, _ = build_confound_design_matrix(
+            test_metadata,
+            ("site", "age", "sex"),
+            site_categories=tuple(summary["site_categories"]),
+            age_mean=summary["age_mean"],
+            age_scale=summary["age_scale"],
+            sex_mean=summary["sex_mean"],
+            sex_scale=summary["sex_scale"],
+        )
+        expected_test = test_features - test_design @ expected_beta
+
+        np.testing.assert_allclose(residual_train, expected_train)
+        np.testing.assert_allclose(residual_test, expected_test)
+        self.assertTrue(summary["enabled"])
+        self.assertEqual(summary["variables"], ["site", "age", "sex"])
+
+    def test_linear_svm_baseline_runs_in_leak_free_pipeline(self):
+        feature_vectors, labels, feature_indices = make_synthetic_feature_matrix()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.make_fast_config(
+                temp_dir,
+                explanation_methods=(),
+                model_type="linear_svm",
+            )
+            summary = train_and_eval_model(
+                feature_vectors,
+                labels,
+                pipeline='synthetic',
+                feature_indices=feature_indices,
+                verbose=False,
+                config=config,
+            )
+
+        self.assertEqual(len(summary.fold_results), 5)
+        self.assertIn("accuracy", summary.metrics_summary)
+        self.assertEqual(summary.fold_results[0].training_summary["model_type"], "linear_svm")
+
+    def test_anova_selector_runs_in_leak_free_pipeline(self):
+        feature_vectors, labels, feature_indices = make_synthetic_feature_matrix()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.make_fast_config(
+                temp_dir,
+                explanation_methods=(),
+                selector_type="anova_f",
+            )
+            summary = train_and_eval_model(
+                feature_vectors,
+                labels,
+                pipeline='synthetic',
+                feature_indices=feature_indices,
+                verbose=False,
+                config=config,
+            )
+
+        self.assertEqual(len(summary.fold_results), 5)
+        for fold_result in summary.fold_results:
+            self.assertEqual(fold_result.selected_feature_count, config.num_selected_features)
+            self.assertEqual(len(fold_result.selection.selected_feature_indices), config.num_selected_features)
 
     def test_hyperparameter_sweep_builds_fixed_configs_with_separate_artifact_roots(self):
         base_config = self.make_fast_config(
