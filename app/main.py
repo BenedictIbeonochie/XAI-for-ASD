@@ -498,6 +498,7 @@ def clone_module_state(module):
 
 
 def compute_average_loss(model, dataloader, criterion):
+  model = model.to(device)
   model.eval()
   total_loss = 0.0
   total_samples = 0
@@ -519,6 +520,7 @@ def compute_average_loss(model, dataloader, criterion):
 
 
 def train_supervised_stage(model, train_dataloader, val_dataloader, criterion, optimizer, max_epochs, patience, min_delta, stage_name, verbose=False):
+  model = model.to(device)
   best_state = clone_module_state(model)
   best_val_loss = float('inf')
   best_epoch = 0
@@ -1235,6 +1237,7 @@ def train_single_fold_model(train_dataloader, val_dataloader, input_size, config
 
 
 def evaluate_model(model, test_dataloader):
+  model = model.to(device)
   model.eval()
   true_labels = []
   predicted_labels = []
