@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
 from matplotlib import colormaps, colorbar
 import collections
+from itertools import product
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 from torch.utils.data import Subset
@@ -24,6 +25,7 @@ import seaborn as sns
 from sklearn.svm import SVC
 from sklearn.feature_selection import RFE
 from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.preprocessing import StandardScaler
 from captum.attr import IntegratedGradients, DeepLiftShap, DeepLift, GradientShap, ShapleyValueSampling, ShapleyValues, FeatureAblation, GuidedBackprop, Occlusion
 from nilearn import datasets, plotting
 import networkx as nx
@@ -164,6 +166,8 @@ def safe_divide(numerator, denominator):
 class ReanalysisConfig:
   n_splits: int = 5
   num_selected_features: int = 1000
+  feature_count_candidates: tuple[int, ...] = ()
+  feature_count_selection_metric: str = "f1"
   rfe_step: int = 20
   validation_size: float = 0.2
   batch_size: int = 128
@@ -171,6 +175,8 @@ class ReanalysisConfig:
   ae2_epochs: int = 50
   classifier_epochs: int = 300
   fine_tuning_epochs: int = 125
+  early_stopping_patience: int = 15
+  early_stopping_min_delta: float = 1e-4
   ae_learning_rate: float = 0.001
   classifier_learning_rate: float = 0.001
   fine_tuning_learning_rate: float = 0.0001
@@ -178,6 +184,7 @@ class ReanalysisConfig:
   random_seed: int = DEFAULT_SEED
   ae1_hidden_size: int | None = 500
   ae2_hidden_size: int | None = 100
+  use_feature_scaling: bool = True
   explanation_methods: tuple[str, ...] = DEFAULT_INTERPRETATION_METHODS
   explanation_top_n: int = 50
   explanation_background_samples: int = 100
@@ -211,12 +218,17 @@ class FoldResult:
   validation_indices: np.ndarray
   test_indices: np.ndarray
   selection: RFESelection
+  selected_feature_count: int
   metrics: dict[str, Any]
   true_labels: np.ndarray
   predicted_labels: np.ndarray
   train_feature_shape: tuple[int, int]
   validation_feature_shape: tuple[int, int]
   test_feature_shape: tuple[int, int]
+  scaler_mean: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=float))
+  scaler_scale: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=float))
+  feature_count_tuning_records: list[dict[str, Any]] = field(default_factory=list)
+  training_summary: dict[str, Any] = field(default_factory=dict)
   explanation_rankings: dict[str, ExplanationRanking] = field(default_factory=dict)
   artifact_dir: str | None = None
   model_checkpoint_path: str | None = None
@@ -251,6 +263,42 @@ def slugify_method_name(method_name):
   return method_name.lower().replace(" ", "_")
 
 
+def dedupe_preserve_order(values):
+  seen = set()
+  ordered_values = []
+
+  for value in values:
+    if value in seen:
+      continue
+    seen.add(value)
+    ordered_values.append(value)
+
+  return tuple(ordered_values)
+
+
+def normalize_sweep_candidates(candidates, default_value, cast_type):
+  if candidates is None:
+    return (cast_type(default_value),)
+
+  normalized_values = []
+  for candidate in candidates:
+    value = cast_type(candidate)
+    if isinstance(value, (int, float)) and value <= 0:
+      continue
+    normalized_values.append(value)
+
+  if not normalized_values:
+    normalized_values = [cast_type(default_value)]
+
+  return dedupe_preserve_order(normalized_values)
+
+
+def slugify_sweep_value(value):
+  if isinstance(value, float):
+    return format(value, '.6g').replace('.', 'p').replace('-', 'm')
+  return str(value).replace('.', 'p').replace('-', 'm')
+
+
 def prepare_feature_index_lookup(indices):
   indices = np.asarray(indices)
   if indices.ndim == 3:
@@ -260,8 +308,84 @@ def prepare_feature_index_lookup(indices):
   raise ValueError("indices must have shape (samples, features, 2) or (features, 2)")
 
 
+def coerce_explanation_ranking(roi_pairs, weights, feature_indices):
+  roi_pairs = np.asarray(roi_pairs, dtype=int)
+  if roi_pairs.size == 0:
+    roi_pairs = np.empty((0, 2), dtype=int)
+  elif roi_pairs.ndim == 1 and roi_pairs.shape[0] == 2:
+    roi_pairs = roi_pairs.reshape(1, 2)
+  elif roi_pairs.ndim != 2 or roi_pairs.shape[1] != 2:
+    raise ValueError("roi_pairs must have shape (features, 2).")
+
+  weights = np.asarray(weights, dtype=float).reshape(-1)
+  feature_indices = np.asarray(feature_indices, dtype=int).reshape(-1)
+
+  lengths = (len(roi_pairs), len(weights), len(feature_indices))
+  aligned_length = min(lengths)
+
+  if aligned_length == 0:
+    if any(lengths):
+      raise ValueError(
+        "Explanation outputs must either all be empty or all contain at least one ranked feature."
+      )
+    return ExplanationRanking()
+
+  roi_pairs = roi_pairs[:aligned_length]
+  weights = weights[:aligned_length]
+  feature_indices = feature_indices[:aligned_length]
+
+  return ExplanationRanking(
+    roi_pairs=roi_pairs,
+    weights=weights,
+    feature_indices=feature_indices,
+  )
+
+
+def sanitize_feature_matrix(features):
+  return np.nan_to_num(np.asarray(features, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+
+
 def apply_feature_selection(features, selection):
-  return np.asarray(features)[:, selection.selected_feature_indices]
+  return sanitize_feature_matrix(features)[:, selection.selected_feature_indices]
+
+
+def get_candidate_feature_counts(config, max_feature_count):
+  raw_candidates = config.feature_count_candidates if config.feature_count_candidates else (config.num_selected_features,)
+  normalized_candidates = []
+
+  for candidate in raw_candidates:
+    candidate = int(candidate)
+    if candidate <= 0:
+      continue
+    normalized_candidates.append(min(candidate, max_feature_count))
+
+  if not normalized_candidates:
+    normalized_candidates.append(min(config.num_selected_features, max_feature_count))
+
+  return tuple(sorted(set(normalized_candidates)))
+
+
+def scale_feature_sets(train_features, config, *other_feature_sets):
+  train_features = sanitize_feature_matrix(train_features)
+  other_feature_sets = [sanitize_feature_matrix(feature_set) for feature_set in other_feature_sets]
+
+  if not config.use_feature_scaling:
+    scaling_summary = {
+      'enabled': False,
+      'mean': np.empty(0, dtype=float),
+      'scale': np.empty(0, dtype=float),
+    }
+    return train_features, other_feature_sets, scaling_summary
+
+  scaler = StandardScaler()
+  train_scaled = scaler.fit_transform(train_features)
+  transformed_sets = [scaler.transform(feature_set) for feature_set in other_feature_sets]
+  scaling_summary = {
+    'enabled': True,
+    'mean': np.asarray(scaler.mean_, dtype=float),
+    'scale': np.asarray(scaler.scale_, dtype=float),
+  }
+  return train_scaled, transformed_sets, scaling_summary
 
 
 def build_dataloader(features, labels, batch_size, shuffle):
@@ -366,6 +490,98 @@ def write_json_file(path, payload):
     json.dump(to_serializable(payload), json_file, indent=2)
   
 
+def clone_module_state(module):
+  return {
+    key: value.detach().cpu().clone()
+    for key, value in module.state_dict().items()
+  }
+
+
+def compute_average_loss(model, dataloader, criterion):
+  model.eval()
+  total_loss = 0.0
+  total_samples = 0
+
+  with torch.no_grad():
+    for data, labels in dataloader:
+      data = data.float().to(device)
+      labels = labels.long().to(device)
+      outputs = model(data)
+      loss = criterion(outputs, labels)
+      batch_size = labels.shape[0]
+      total_loss += float(loss.item()) * batch_size
+      total_samples += batch_size
+
+  if total_samples == 0:
+    return float('inf')
+
+  return total_loss / total_samples
+
+
+def train_supervised_stage(model, train_dataloader, val_dataloader, criterion, optimizer, max_epochs, patience, min_delta, stage_name, verbose=False):
+  best_state = clone_module_state(model)
+  best_val_loss = float('inf')
+  best_epoch = 0
+  epochs_without_improvement = 0
+  history = []
+
+  for epoch in range(max_epochs):
+    model.train()
+    total_train_loss = 0.0
+    total_train_samples = 0
+
+    for data, labels in train_dataloader:
+      data = data.float().to(device)
+      labels = labels.long().to(device)
+      optimizer.zero_grad()
+      outputs = model(data)
+      loss = criterion(outputs, labels)
+      loss.backward()
+      optimizer.step()
+
+      batch_size = labels.shape[0]
+      total_train_loss += float(loss.item()) * batch_size
+      total_train_samples += batch_size
+
+    average_train_loss = safe_divide(total_train_loss, total_train_samples)
+    val_loss = compute_average_loss(model, val_dataloader, criterion)
+    improved = val_loss < (best_val_loss - min_delta)
+
+    history.append({
+      'epoch': epoch + 1,
+      'train_loss': float(average_train_loss),
+      'validation_loss': float(val_loss),
+      'improved': bool(improved),
+    })
+
+    if improved:
+      best_val_loss = val_loss
+      best_epoch = epoch + 1
+      best_state = clone_module_state(model)
+      epochs_without_improvement = 0
+    else:
+      epochs_without_improvement += 1
+
+    if verbose:
+      print(
+        f"{stage_name} epoch {epoch + 1}/{max_epochs} "
+        f"train_loss={average_train_loss:.6f} val_loss={val_loss:.6f}"
+      )
+
+    if patience and epochs_without_improvement >= patience:
+      break
+
+  model.load_state_dict(best_state)
+
+  return {
+    'stage_name': stage_name,
+    'epochs_trained': len(history),
+    'best_epoch': best_epoch,
+    'best_validation_loss': float(best_val_loss),
+    'history': history,
+  }
+
+
 class Autoencoder(nn.Module):
   def __init__(self, input_size, encoded_output_size, rho=0.2, beta=2, criterion=nn.MSELoss()):
     """
@@ -417,8 +633,8 @@ class StackedAutoencoder(nn.Module):
       self.classifier = classifier 
 
   def forward(self, x):
-      x = self.ae1.encoder(x)  # Pass through the encoder of AE1
-      x = self.ae2.encoder(x)  # Pass through the encoder of AE2
+      x = torch.relu(self.ae1.encoder(x))  # Match the non-linearity used during autoencoder pretraining
+      x = torch.relu(self.ae2.encoder(x))  # Preserve the learned staged representation
       x = self.classifier(x)
       return x
   
@@ -551,7 +767,7 @@ def find_top_rois_using_LIME(N, model, test_dataloader, train_dataloader, rois):
 
   sorted_feature_weights = [abs(feature[1]) for feature in sorted_features]
 
-  return rois[sorted_feature_indices[:N]], sorted_feature_weights[:N], sorted_feature_indices
+  return rois[sorted_feature_indices[:N]], sorted_feature_weights[:N], sorted_feature_indices[:N]
 
 def find_index_from_string(stri):
   stri = stri.split(' ')
@@ -936,6 +1152,10 @@ def train_single_fold_model(train_dataloader, val_dataloader, input_size, config
   optimizer_classifier = optim.Adam(classifier.parameters(), lr=config.classifier_learning_rate, weight_decay=config.weight_decay)
   optimizer_model = optim.Adam(model.parameters(), lr=config.fine_tuning_learning_rate, weight_decay=config.weight_decay)
   classifier_criterion = nn.CrossEntropyLoss()
+  training_summary = {
+    'ae1': {'epochs_trained': config.ae1_epochs},
+    'ae2': {'epochs_trained': config.ae2_epochs},
+  }
 
   for epoch in range(config.ae1_epochs):
     for data, _ in train_dataloader:
@@ -985,33 +1205,33 @@ def train_single_fold_model(train_dataloader, val_dataloader, input_size, config
     device,
   )
 
-  for epoch in range(config.classifier_epochs):
-    for data, labels in encoded_classifier_train_loader:
-      data = data.float().to(device)
-      labels = labels.long().to(device)
-      optimizer_classifier.zero_grad()
-      outputs = classifier(data)
-      loss = classifier_criterion(outputs, labels)
-      loss.backward()
-      optimizer_classifier.step()
+  training_summary['classifier'] = train_supervised_stage(
+    classifier,
+    encoded_classifier_train_loader,
+    encoded_classifier_val_loader,
+    classifier_criterion,
+    optimizer_classifier,
+    config.classifier_epochs,
+    config.early_stopping_patience,
+    config.early_stopping_min_delta,
+    "Classifier",
+    verbose=verbose,
+  )
 
-    if verbose:
-      print(f"Classifier epoch {epoch + 1}/{config.classifier_epochs} loss={loss.item():.6f}")
+  training_summary['fine_tuning'] = train_supervised_stage(
+    model,
+    train_dataloader,
+    val_dataloader,
+    classifier_criterion,
+    optimizer_model,
+    config.fine_tuning_epochs,
+    config.early_stopping_patience,
+    config.early_stopping_min_delta,
+    "Fine-tuning",
+    verbose=verbose,
+  )
 
-  for epoch in range(config.fine_tuning_epochs):
-    for data, labels in train_dataloader:
-      data = data.float().to(device)
-      labels = labels.long().to(device)
-      optimizer_model.zero_grad()
-      outputs = model(data)
-      loss = classifier_criterion(outputs, labels)
-      loss.backward()
-      optimizer_model.step()
-
-    if verbose:
-      print(f"Fine-tuning epoch {epoch + 1}/{config.fine_tuning_epochs} loss={loss.item():.6f}")
-
-  return model
+  return model, training_summary
 
 
 def evaluate_model(model, test_dataloader):
@@ -1035,6 +1255,86 @@ def evaluate_model(model, test_dataloader):
   return metrics, true_labels, predicted_labels
 
 
+def select_feature_count_for_fold(feature_vectors, labels_from_abide, roi_lookup, train_indices, validation_indices, config, verbose=False):
+  candidate_feature_counts = get_candidate_feature_counts(config, feature_vectors.shape[1])
+
+  if len(candidate_feature_counts) == 1:
+    return candidate_feature_counts[0], []
+
+  tuning_records = []
+  valid_metric_names = {'accuracy', 'sensitivity', 'specificity', 'precision', 'f1'}
+  metric_name = config.feature_count_selection_metric if config.feature_count_selection_metric in valid_metric_names else 'f1'
+  best_metric_value = float('-inf')
+  best_accuracy = float('-inf')
+  best_feature_count = candidate_feature_counts[0]
+
+  for feature_count in candidate_feature_counts:
+    candidate_selection = get_top_features_from_SVM_RFE(
+      feature_vectors[train_indices],
+      labels_from_abide[train_indices],
+      roi_lookup,
+      feature_count,
+      config.rfe_step,
+      training_sample_indices=train_indices,
+    )
+
+    candidate_train_features = apply_feature_selection(feature_vectors[train_indices], candidate_selection)
+    candidate_validation_features = apply_feature_selection(feature_vectors[validation_indices], candidate_selection)
+    candidate_train_features, [candidate_validation_features], _ = scale_feature_sets(
+      candidate_train_features,
+      config,
+      candidate_validation_features,
+    )
+
+    candidate_train_labels = labels_from_abide[train_indices]
+    candidate_validation_labels = labels_from_abide[validation_indices]
+    candidate_train_loader = build_dataloader(candidate_train_features, candidate_train_labels, config.batch_size, shuffle=True)
+    candidate_validation_loader = build_dataloader(candidate_validation_features, candidate_validation_labels, config.batch_size, shuffle=False)
+
+    candidate_model, candidate_training_summary = train_single_fold_model(
+      candidate_train_loader,
+      candidate_validation_loader,
+      input_size=candidate_train_features.shape[1],
+      config=config,
+      verbose=False,
+    )
+    candidate_metrics, _, _ = evaluate_model(candidate_model, candidate_validation_loader)
+    metric_value = float(candidate_metrics[metric_name])
+    accuracy_value = float(candidate_metrics['accuracy'])
+    tuning_records.append({
+      'feature_count': int(feature_count),
+      'selection_training_sample_indices': np.asarray(train_indices, dtype=int),
+      'validation_metrics': candidate_metrics,
+      'training_summary': candidate_training_summary,
+    })
+
+    if verbose:
+      print(
+        f"Feature-count candidate {feature_count}: "
+        f"validation_{metric_name}={metric_value:.4f}, "
+        f"validation_accuracy={accuracy_value:.4f}"
+      )
+
+    if (
+      metric_value > best_metric_value
+      or (
+        np.isclose(metric_value, best_metric_value)
+        and (
+          accuracy_value > best_accuracy
+          or (
+            np.isclose(accuracy_value, best_accuracy)
+            and feature_count < best_feature_count
+          )
+        )
+      )
+    ):
+      best_metric_value = metric_value
+      best_accuracy = accuracy_value
+      best_feature_count = int(feature_count)
+
+  return best_feature_count, tuning_records
+
+
 def compute_fold_explanations(model, train_dataloader, test_dataloader, selected_roi_pairs, config):
   explanation_rankings = {}
   selected_roi_pairs = np.asarray(selected_roi_pairs, dtype=int)
@@ -1055,10 +1355,10 @@ def compute_fold_explanations(model, train_dataloader, test_dataloader, selected
         train_dataloader,
         selected_roi_pairs,
       )
-      explanation_rankings[method_name] = ExplanationRanking(
-        roi_pairs=np.asarray(roi_pairs, dtype=int),
-        weights=np.asarray(weights, dtype=float),
-        feature_indices=np.asarray(feature_indices, dtype=int),
+      explanation_rankings[method_name] = coerce_explanation_ranking(
+        roi_pairs,
+        weights,
+        feature_indices,
       )
     except Exception as error:
       explanation_rankings[method_name] = ExplanationRanking(
@@ -1157,6 +1457,9 @@ def write_fold_artifacts(fold_result, artifact_dir):
   artifact_dir = ensure_directory(artifact_dir)
   np.savetxt(artifact_dir / 'selected_feature_indices.csv', fold_result.selection.selected_feature_indices, delimiter=',', fmt='%d')
   np.savetxt(artifact_dir / 'selected_roi_pairs.csv', fold_result.selection.selected_roi_pairs, delimiter=',', fmt='%d')
+  if len(fold_result.scaler_mean):
+    np.savetxt(artifact_dir / 'scaler_mean.csv', fold_result.scaler_mean, delimiter=',')
+    np.savetxt(artifact_dir / 'scaler_scale.csv', fold_result.scaler_scale, delimiter=',')
 
   prediction_df = pd.DataFrame({
     'sample_index': fold_result.test_indices,
@@ -1165,6 +1468,14 @@ def write_fold_artifacts(fold_result, artifact_dir):
   })
   prediction_df.to_csv(artifact_dir / 'predictions.csv', index=False)
   write_json_file(artifact_dir / 'metrics.json', fold_result.metrics)
+  write_json_file(
+    artifact_dir / 'feature_count_tuning.json',
+    {
+      'selected_feature_count': fold_result.selected_feature_count,
+      'candidates': fold_result.feature_count_tuning_records,
+    },
+  )
+  write_json_file(artifact_dir / 'training_summary.json', fold_result.training_summary)
 
   for method_name, explanation in fold_result.explanation_rankings.items():
     method_slug = slugify_method_name(method_name)
@@ -1195,6 +1506,7 @@ def write_pipeline_artifacts(summary):
   for fold_result in summary.fold_results:
     fold_metric_rows.append({
       'fold_id': fold_result.fold_id,
+      'selected_feature_count': fold_result.selected_feature_count,
       'accuracy': fold_result.metrics['accuracy'],
       'sensitivity': fold_result.metrics['sensitivity'],
       'specificity': fold_result.metrics['specificity'],
@@ -1227,7 +1539,7 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
   if feature_indices is None:
     raise ValueError("feature_indices must be provided for the corrected fold-specific reanalysis.")
 
-  feature_vectors = np.asarray(feature_vectors, dtype=float)
+  feature_vectors = sanitize_feature_matrix(feature_vectors)
   labels_from_abide = np.asarray(labels_from_abide, dtype=int)
   roi_lookup = prepare_feature_index_lookup(feature_indices)
 
@@ -1236,7 +1548,6 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
 
   set_random_seed(config.random_seed)
   skf = StratifiedKFold(n_splits=config.n_splits, shuffle=True, random_state=config.random_seed)
-  selected_feature_count = min(config.num_selected_features, feature_vectors.shape[1])
 
   pipeline_artifact_dir = None
   if config.save_artifacts:
@@ -1251,6 +1562,23 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
     outer_train_indices = np.asarray(outer_train_indices, dtype=int)
     test_indices = np.asarray(test_indices, dtype=int)
 
+    train_indices, validation_indices = split_outer_train_validation(
+      outer_train_indices,
+      labels_from_abide,
+      config.validation_size,
+      config.random_seed + fold_id,
+    )
+
+    selected_feature_count, feature_count_tuning_records = select_feature_count_for_fold(
+      feature_vectors,
+      labels_from_abide,
+      roi_lookup,
+      train_indices,
+      validation_indices,
+      config,
+      verbose=verbose,
+    )
+
     selection = get_top_features_from_SVM_RFE(
       feature_vectors[outer_train_indices],
       labels_from_abide[outer_train_indices],
@@ -1260,16 +1588,15 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
       training_sample_indices=outer_train_indices,
     )
 
-    train_indices, validation_indices = split_outer_train_validation(
-      outer_train_indices,
-      labels_from_abide,
-      config.validation_size,
-      config.random_seed + fold_id,
-    )
-
     train_features = apply_feature_selection(feature_vectors[train_indices], selection)
     validation_features = apply_feature_selection(feature_vectors[validation_indices], selection)
     test_features = apply_feature_selection(feature_vectors[test_indices], selection)
+    train_features, [validation_features, test_features], scaling_summary = scale_feature_sets(
+      train_features,
+      config,
+      validation_features,
+      test_features,
+    )
 
     train_labels = labels_from_abide[train_indices]
     validation_labels = labels_from_abide[validation_indices]
@@ -1279,7 +1606,13 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
     validation_dataloader = build_dataloader(validation_features, validation_labels, config.batch_size, shuffle=False)
     test_dataloader = build_dataloader(test_features, test_labels, config.batch_size, shuffle=False)
 
-    model = train_single_fold_model(
+    if verbose:
+      print(
+        f"Fold {fold_id}: selected {selected_feature_count} features "
+        f"from {feature_vectors.shape[1]} candidates"
+      )
+
+    model, training_summary = train_single_fold_model(
       train_dataloader,
       validation_dataloader,
       input_size=train_features.shape[1],
@@ -1310,12 +1643,17 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
       validation_indices=validation_indices,
       test_indices=test_indices,
       selection=selection,
+      selected_feature_count=selected_feature_count,
       metrics=metrics,
       true_labels=true_labels,
       predicted_labels=predicted_labels,
       train_feature_shape=train_features.shape,
       validation_feature_shape=validation_features.shape,
       test_feature_shape=test_features.shape,
+      scaler_mean=np.asarray(scaling_summary['mean'], dtype=float),
+      scaler_scale=np.asarray(scaling_summary['scale'], dtype=float),
+      feature_count_tuning_records=feature_count_tuning_records,
+      training_summary=training_summary,
       explanation_rankings=explanation_rankings,
       artifact_dir=str(fold_artifact_dir) if fold_artifact_dir is not None else None,
       model_checkpoint_path=str(model_checkpoint_path) if model_checkpoint_path is not None else None,
@@ -1363,6 +1701,139 @@ def replace_features_with_0(data, feature_indices_to_remove):
   data[:, feature_indices_to_remove] = 0
 
   return data
+
+
+def build_hyperparameter_sweep_configs(
+  base_config,
+  pipeline,
+  sweep_root,
+  feature_counts=None,
+  ae1_hidden_sizes=None,
+  ae2_hidden_sizes=None,
+  ae_learning_rates=None,
+  classifier_learning_rates=None,
+  fine_tuning_learning_rates=None,
+  weight_decays=None,
+):
+  sweep_root = Path(sweep_root)
+  feature_counts = normalize_sweep_candidates(feature_counts, base_config.num_selected_features, int)
+  ae1_hidden_sizes = normalize_sweep_candidates(ae1_hidden_sizes, base_config.ae1_hidden_size or 1, int)
+  ae2_hidden_sizes = normalize_sweep_candidates(ae2_hidden_sizes, base_config.ae2_hidden_size or 1, int)
+  ae_learning_rates = normalize_sweep_candidates(ae_learning_rates, base_config.ae_learning_rate, float)
+  classifier_learning_rates = normalize_sweep_candidates(classifier_learning_rates, base_config.classifier_learning_rate, float)
+  fine_tuning_learning_rates = normalize_sweep_candidates(fine_tuning_learning_rates, base_config.fine_tuning_learning_rate, float)
+  weight_decays = normalize_sweep_candidates(weight_decays, base_config.weight_decay, float)
+
+  sweep_configs = []
+
+  for combination_index, combination in enumerate(product(
+    feature_counts,
+    ae1_hidden_sizes,
+    ae2_hidden_sizes,
+    ae_learning_rates,
+    classifier_learning_rates,
+    fine_tuning_learning_rates,
+    weight_decays,
+  ), start=1):
+    (
+      feature_count,
+      ae1_hidden_size,
+      ae2_hidden_size,
+      ae_learning_rate,
+      classifier_learning_rate,
+      fine_tuning_learning_rate,
+      weight_decay,
+    ) = combination
+
+    config_name = (
+      f"fs{feature_count}"
+      f"_ae1{slugify_sweep_value(ae1_hidden_size)}"
+      f"_ae2{slugify_sweep_value(ae2_hidden_size)}"
+      f"_aelr{slugify_sweep_value(ae_learning_rate)}"
+      f"_clrlr{slugify_sweep_value(classifier_learning_rate)}"
+      f"_ftlr{slugify_sweep_value(fine_tuning_learning_rate)}"
+      f"_wd{slugify_sweep_value(weight_decay)}"
+    )
+
+    config = ReanalysisConfig(**asdict(base_config))
+    config.num_selected_features = int(feature_count)
+    config.feature_count_candidates = ()
+    config.ae1_hidden_size = int(ae1_hidden_size)
+    config.ae2_hidden_size = int(ae2_hidden_size)
+    config.ae_learning_rate = float(ae_learning_rate)
+    config.classifier_learning_rate = float(classifier_learning_rate)
+    config.fine_tuning_learning_rate = float(fine_tuning_learning_rate)
+    config.weight_decay = float(weight_decay)
+    config.explanation_methods = ()
+    config.save_model_checkpoints = False
+    config.artifact_root = str(sweep_root / config_name)
+
+    sweep_configs.append({
+      'index': combination_index,
+      'name': config_name,
+      'parameters': {
+        'num_selected_features': int(feature_count),
+        'ae1_hidden_size': int(ae1_hidden_size),
+        'ae2_hidden_size': int(ae2_hidden_size),
+        'ae_learning_rate': float(ae_learning_rate),
+        'classifier_learning_rate': float(classifier_learning_rate),
+        'fine_tuning_learning_rate': float(fine_tuning_learning_rate),
+        'weight_decay': float(weight_decay),
+      },
+      'config': config,
+      'pipeline': pipeline,
+    })
+
+  return sweep_configs
+
+
+def run_hyperparameter_sweep(pipeline, base_config, sweep_configs, sweep_root, verbose=False):
+  sweep_root = ensure_directory(sweep_root)
+  sweep_rows = []
+  sweep_records = []
+
+  for sweep_entry in sweep_configs:
+    config_name = sweep_entry['name']
+    config = sweep_entry['config']
+
+    if verbose:
+      print("\n" + "-" * 100)
+      print(f"Sweep configuration {sweep_entry['index']}/{len(sweep_configs)}: {config_name}")
+      print(json.dumps(sweep_entry['parameters'], indent=2))
+      print("-" * 100)
+
+    summary = run_pipeline_reanalysis(pipeline, verbose=verbose, config=config)
+
+    row = {
+      'config_name': config_name,
+      **sweep_entry['parameters'],
+      'accuracy_mean': float(summary.metrics_summary['accuracy']['mean']),
+      'accuracy_std': float(summary.metrics_summary['accuracy']['std']),
+      'f1_mean': float(summary.metrics_summary['f1']['mean']),
+      'f1_std': float(summary.metrics_summary['f1']['std']),
+      'specificity_mean': float(summary.metrics_summary['specificity']['mean']),
+      'precision_mean': float(summary.metrics_summary['precision']['mean']),
+      'artifact_dir': summary.artifact_dir,
+      'fold_selected_feature_counts': [int(fold_result.selected_feature_count) for fold_result in summary.fold_results],
+    }
+    sweep_rows.append(row)
+    sweep_records.append({
+      'config_name': config_name,
+      'parameters': sweep_entry['parameters'],
+      'summary': summary,
+    })
+
+  sweep_df = pd.DataFrame(sweep_rows)
+  if not sweep_df.empty:
+    sweep_df = sweep_df.sort_values(
+      ['accuracy_mean', 'f1_mean', 'accuracy_std'],
+      ascending=[False, False, True],
+    ).reset_index(drop=True)
+
+  sweep_df.to_csv(sweep_root / 'results.csv', index=False)
+  write_json_file(sweep_root / 'results.json', sweep_rows)
+
+  return sweep_df, sweep_records
 
 
 def run_pipeline_reanalysis(pipeline, verbose=False, config=None):
@@ -1647,7 +2118,28 @@ if __name__ == "__main__":
   parser.add_argument('--pipelines', nargs='*', default=['ccs', 'cpac', 'dparsf', 'niak'], help='Pipelines to reanalyse using fold-specific feature selection.')
   parser.add_argument('--artifact_root', default='artifacts/reanalysis', help='Directory for corrected reanalysis artifacts.')
   parser.add_argument('--num_selected_features', type=int, default=1000, help='Number of fold-local SVM-RFE features to keep.')
+  parser.add_argument('--ae1_hidden_size', type=int, default=500, help='Hidden size for the first autoencoder layer.')
+  parser.add_argument('--ae2_hidden_size', type=int, default=100, help='Hidden size for the second autoencoder layer.')
+  parser.add_argument('--feature_count_candidates', nargs='*', type=int, default=None, help='Optional feature-count candidates to tune inside each training fold, e.g. --feature_count_candidates 250 500 750 1000')
+  parser.add_argument('--feature_count_selection_metric', default='f1', help='Validation metric used to choose feature count. Options: accuracy, sensitivity, specificity, precision, f1')
   parser.add_argument('--rfe_step', type=int, default=20, help='SVM-RFE elimination step size.')
+  parser.add_argument('--early_stopping_patience', type=int, default=15, help='Number of validation epochs without improvement before stopping classifier/fine-tuning.')
+  parser.add_argument('--early_stopping_min_delta', type=float, default=1e-4, help='Minimum validation-loss improvement required to reset early stopping.')
+  parser.add_argument('--ae_learning_rate', type=float, default=0.001, help='Learning rate for autoencoder pretraining.')
+  parser.add_argument('--classifier_learning_rate', type=float, default=0.001, help='Learning rate for the classifier stage.')
+  parser.add_argument('--fine_tuning_learning_rate', type=float, default=0.0001, help='Learning rate for the end-to-end fine-tuning stage.')
+  parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay used across the training stages.')
+  parser.add_argument('--use_feature_scaling', type=lambda x: (str(x).lower() == 'true'), default=True, help='Scale selected features inside each fold using training data only.')
+  parser.add_argument('--run_hyperparameter_sweep', type=lambda x: (str(x).lower() == 'true'), default=False, help='Run a series of fixed, leak-free configurations and save a comparison table.')
+  parser.add_argument('--sweep_name', default='hyperparameter_sweep', help='Artifact subdirectory name for the fixed-configuration sweep summary.')
+  parser.add_argument('--sweep_feature_counts', nargs='*', type=int, default=None, help='Feature-count values to compare across full leak-free runs.')
+  parser.add_argument('--sweep_ae1_hidden_sizes', nargs='*', type=int, default=None, help='AE1 hidden sizes to compare across full leak-free runs.')
+  parser.add_argument('--sweep_ae2_hidden_sizes', nargs='*', type=int, default=None, help='AE2 hidden sizes to compare across full leak-free runs.')
+  parser.add_argument('--sweep_ae_learning_rates', nargs='*', type=float, default=None, help='Autoencoder learning rates to compare across full leak-free runs.')
+  parser.add_argument('--sweep_classifier_learning_rates', nargs='*', type=float, default=None, help='Classifier learning rates to compare across full leak-free runs.')
+  parser.add_argument('--sweep_fine_tuning_learning_rates', nargs='*', type=float, default=None, help='Fine-tuning learning rates to compare across full leak-free runs.')
+  parser.add_argument('--sweep_weight_decays', nargs='*', type=float, default=None, help='Weight-decay values to compare across full leak-free runs.')
+  parser.add_argument('--max_sweep_configs', type=int, default=24, help='Safety cap on the number of fixed-configuration sweep combinations.')
   parser.add_argument('--run_permutation_test', type=lambda x: (str(x).lower() == 'true'), default=False, help='Run the corrected CCS permutation test.')
   parser.add_argument('--num_permutations', type=int, default=100, help='Number of label permutations for the corrected CCS permutation test.')
 
@@ -1658,25 +2150,40 @@ if __name__ == "__main__":
   save_model = args.save_model
   interpretation_methods = args.interpretation_methods
   analyze_methods = args.analyze_methods
+  run_hyperparameter_sweep_flag = args.run_hyperparameter_sweep
 
   print("verbose: ", verbose)
   print("train_model: ", train_model)
   print("save_model: ", save_model)
   print("interpretation_methods: ", interpretation_methods)
   print("analyze_methods: ", analyze_methods)
+  print("run_hyperparameter_sweep: ", run_hyperparameter_sweep_flag)
   print("Torch Cuda is Available =", use_cuda)
 
   if not train_model:
     raise RuntimeError("Correction mode requires fold-specific retraining. Legacy checkpoint loading is disabled.")
   if analyze_methods:
     raise RuntimeError("ROAR is disabled in the corrected workflow. Re-run ROAR from fold-specific corrected artifacts instead.")
+  if run_hyperparameter_sweep_flag and args.run_permutation_test:
+    raise RuntimeError("Run the hyperparameter sweep and the permutation test separately to keep artifacts and runtime manageable.")
 
   selected_methods = DEFAULT_INTERPRETATION_METHODS if interpretation_methods else ()
   base_config = ReanalysisConfig(
     random_seed=DEFAULT_SEED,
     artifact_root=args.artifact_root,
     num_selected_features=args.num_selected_features,
+    ae1_hidden_size=args.ae1_hidden_size,
+    ae2_hidden_size=args.ae2_hidden_size,
+    feature_count_candidates=tuple(args.feature_count_candidates or ()),
+    feature_count_selection_metric=args.feature_count_selection_metric,
     rfe_step=args.rfe_step,
+    early_stopping_patience=args.early_stopping_patience,
+    early_stopping_min_delta=args.early_stopping_min_delta,
+    ae_learning_rate=args.ae_learning_rate,
+    classifier_learning_rate=args.classifier_learning_rate,
+    fine_tuning_learning_rate=args.fine_tuning_learning_rate,
+    weight_decay=args.weight_decay,
+    use_feature_scaling=args.use_feature_scaling,
     explanation_methods=tuple(selected_methods),
     save_artifacts=True,
     save_model_checkpoints=save_model,
@@ -1685,6 +2192,44 @@ if __name__ == "__main__":
   pipeline_summaries = {}
 
   for pipeline in args.pipelines:
+    if run_hyperparameter_sweep_flag:
+      sweep_root = ensure_directory(Path(args.artifact_root) / 'hyperparameter_sweeps' / pipeline / args.sweep_name)
+      sweep_base_config = ReanalysisConfig(**asdict(base_config))
+      sweep_configs = build_hyperparameter_sweep_configs(
+        sweep_base_config,
+        pipeline=pipeline,
+        sweep_root=sweep_root,
+        feature_counts=args.sweep_feature_counts,
+        ae1_hidden_sizes=args.sweep_ae1_hidden_sizes,
+        ae2_hidden_sizes=args.sweep_ae2_hidden_sizes,
+        ae_learning_rates=args.sweep_ae_learning_rates,
+        classifier_learning_rates=args.sweep_classifier_learning_rates,
+        fine_tuning_learning_rates=args.sweep_fine_tuning_learning_rates,
+        weight_decays=args.sweep_weight_decays,
+      )
+
+      if len(sweep_configs) > args.max_sweep_configs:
+        raise RuntimeError(
+          f"Requested {len(sweep_configs)} sweep configurations, which exceeds the safety cap of {args.max_sweep_configs}. "
+          "Reduce the candidate lists or raise --max_sweep_configs deliberately."
+        )
+
+      print(f"\nRunning leak-free hyperparameter sweep for pipeline '{pipeline}' with {len(sweep_configs)} configurations")
+      sweep_df, _ = run_hyperparameter_sweep(
+        pipeline,
+        sweep_base_config,
+        sweep_configs,
+        sweep_root,
+        verbose=verbose,
+      )
+
+      if sweep_df.empty:
+        print(f"No sweep results were produced for pipeline '{pipeline}'.")
+      else:
+        print("\nBest sweep results\n")
+        print(sweep_df.head(10).to_string(index=False))
+      continue
+
     print(f"\nRunning corrected reanalysis for pipeline '{pipeline}'")
     pipeline_config = ReanalysisConfig(**asdict(base_config))
     summary = run_pipeline_reanalysis(pipeline, verbose=verbose, config=pipeline_config)
