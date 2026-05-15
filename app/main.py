@@ -66,6 +66,7 @@ DEFAULT_HARMONIZATION_COVARIATES = (
   "age",
   "sex",
 )
+DEFAULT_FEATURE_REPRESENTATION = "edge_vector"
 
 
 def parse_optional_float(value):
@@ -130,36 +131,99 @@ def get_data_from_abide(pipeline, return_subject_metadata=False):
 
   return data, labels
  
-def get_feature_vecs(data):
-  roi_size = data[0].shape[1]
-  feature_vec_size = int(roi_size * (roi_size - 1) / 2)
+def normalize_feature_representation(feature_representation):
+  normalized_representation = str(feature_representation or DEFAULT_FEATURE_REPRESENTATION).strip().lower()
+  if normalized_representation in {"edge_vector", "edge", "lower_triangle"}:
+    return "edge_vector"
+  if normalized_representation in {"graph_summary", "node_summary", "node_profile"}:
+    return "graph_summary"
+  raise ValueError(
+    f"Unknown feature_representation '{feature_representation}'. "
+    "Supported options: edge_vector, graph_summary."
+  )
+
+
+def compute_fisher_connectivity_matrix(subject_roi_timeseries):
+  corr_coefs = np.corrcoef(subject_roi_timeseries, rowvar=False)
+  corr_coefs = np.nan_to_num(corr_coefs)
+  transformed_corr_coefs = np.vectorize(fishers_z_transform)(corr_coefs)
+  transformed_corr_coefs = sanitize_feature_matrix(transformed_corr_coefs)
+  np.fill_diagonal(transformed_corr_coefs, 0.0)
+  return transformed_corr_coefs
+
+
+def build_edge_vector_features(data):
   feature_vecs = []
   feature_indices = []
 
-  vectorized_fisher_transfrom = np.vectorize(fishers_z_transform)
-  
-  for i in range(len(data)):
-    corr_coefs = np.corrcoef(data[i], rowvar=False)
-    corr_coefs = np.nan_to_num(corr_coefs)
-    f = []
-    idx = []
-
-    transformed_corr_coefs = vectorized_fisher_transfrom(corr_coefs)
-
+  for subject_roi_timeseries in data:
+    transformed_corr_coefs = compute_fisher_connectivity_matrix(subject_roi_timeseries)
     lower_triangular_indices = np.tril_indices(transformed_corr_coefs.shape[0], -1)
 
-    for row_idx, col_idx in zip(*lower_triangular_indices):  # Unpack indices
-      coefficient = transformed_corr_coefs[row_idx, col_idx]
-      f.append(coefficient)
-      idx.append([row_idx, col_idx])
+    feature_vecs.append(transformed_corr_coefs[lower_triangular_indices])
+    feature_indices.append(np.column_stack(lower_triangular_indices))
 
-    feature_vecs.append(f)
-    feature_indices.append(idx)
+  return np.asarray(feature_vecs, dtype=float), np.asarray(feature_indices, dtype=int)
 
-  feature_vecs = np.array(feature_vecs)
-  feature_indices = np.array(feature_indices)
 
-  return feature_vecs, feature_indices
+def compute_graph_summary_vector(connectivity_matrix):
+  abs_connectivity = np.abs(connectivity_matrix)
+  positive_connectivity = np.clip(connectivity_matrix, a_min=0.0, a_max=None)
+  negative_connectivity = np.clip(-connectivity_matrix, a_min=0.0, a_max=None)
+  np.fill_diagonal(abs_connectivity, 0.0)
+  np.fill_diagonal(positive_connectivity, 0.0)
+  np.fill_diagonal(negative_connectivity, 0.0)
+
+  graph = nx.from_numpy_array(abs_connectivity)
+  weighted_clustering = np.asarray(
+    [value for _, value in sorted(nx.clustering(graph, weight='weight').items())],
+    dtype=float,
+  )
+
+  node_strength = connectivity_matrix.sum(axis=0)
+  positive_strength = positive_connectivity.sum(axis=0)
+  negative_strength = negative_connectivity.sum(axis=0)
+  absolute_strength = abs_connectivity.sum(axis=0)
+  node_variability = connectivity_matrix.std(axis=0)
+
+  return np.concatenate([
+    node_strength,
+    positive_strength,
+    negative_strength,
+    absolute_strength,
+    node_variability,
+    weighted_clustering,
+  ]).astype(float)
+
+
+def build_graph_summary_features(data):
+  feature_vecs = []
+  feature_indices = []
+  roi_size = data[0].shape[1]
+
+  node_feature_indices = np.tile(np.arange(roi_size, dtype=int), 6)
+  summary_feature_indices = np.column_stack((node_feature_indices, node_feature_indices))
+
+  for subject_roi_timeseries in data:
+    transformed_corr_coefs = compute_fisher_connectivity_matrix(subject_roi_timeseries)
+    feature_vecs.append(compute_graph_summary_vector(transformed_corr_coefs))
+    feature_indices.append(summary_feature_indices.copy())
+
+  return np.asarray(feature_vecs, dtype=float), np.asarray(feature_indices, dtype=int)
+
+
+def get_feature_vecs(data, feature_representation=DEFAULT_FEATURE_REPRESENTATION):
+  feature_representation = normalize_feature_representation(feature_representation)
+
+  if feature_representation == 'edge_vector':
+    return build_edge_vector_features(data)
+  if feature_representation == 'graph_summary':
+    return build_graph_summary_features(data)
+
+  raise ValueError(
+    f"Unknown feature_representation '{feature_representation}'. "
+    "Supported options: edge_vector, graph_summary."
+  )
 
 def get_top_features_from_selector(
   X,
@@ -256,6 +320,7 @@ def safe_divide(numerator, denominator):
 class ReanalysisConfig:
   n_splits: int = 5
   num_selected_features: int = 1000
+  feature_representation: str = DEFAULT_FEATURE_REPRESENTATION
   feature_count_candidates: tuple[int, ...] = ()
   feature_count_selection_metric: str = "f1"
   selector_type: str = "rfe"
@@ -2175,6 +2240,17 @@ def compute_fold_explanations(model, train_dataloader, test_dataloader, selected
   explanation_rankings = {}
   selected_roi_pairs = np.asarray(selected_roi_pairs, dtype=int)
   method_map = get_interpretability_method_map()
+  feature_representation = normalize_feature_representation(config.feature_representation)
+
+  if feature_representation != 'edge_vector':
+    for method_name in config.explanation_methods:
+      explanation_rankings[method_name] = ExplanationRanking(
+        skipped_reason=(
+          f"Interpretation method '{method_name}' is only aggregated for edge_vector features. "
+          f"Current feature_representation is '{config.feature_representation}'."
+        ),
+      )
+    return explanation_rankings
 
   if normalize_model_type(config.model_type) != 'ssae':
     for method_name in config.explanation_methods:
@@ -2692,6 +2768,7 @@ def run_hyperparameter_sweep(pipeline, base_config, sweep_configs, sweep_root, v
 
     row = {
       'config_name': config_name,
+      'feature_representation': config.feature_representation,
       'model_type': config.model_type,
       'selector_type': config.selector_type,
       'enable_confound_regression': bool(config.enable_confound_regression),
@@ -2726,8 +2803,13 @@ def run_hyperparameter_sweep(pipeline, base_config, sweep_configs, sweep_root, v
 
 
 def run_pipeline_reanalysis(pipeline, verbose=False, config=None):
+  if config is None:
+    config = ReanalysisConfig()
   data, labels, subject_metadata = get_data_from_abide(pipeline, return_subject_metadata=True)
-  feature_vectors, feature_indices = get_feature_vecs(data)
+  feature_vectors, feature_indices = get_feature_vecs(
+    data,
+    feature_representation=config.feature_representation,
+  )
   return train_and_eval_model(
     feature_vectors,
     labels,
@@ -3010,6 +3092,7 @@ if __name__ == "__main__":
   parser.add_argument('--pipelines', nargs='*', default=['ccs', 'cpac', 'dparsf', 'niak'], help='Pipelines to reanalyse using fold-specific feature selection.')
   parser.add_argument('--artifact_root', default='artifacts/reanalysis', help='Directory for corrected reanalysis artifacts.')
   parser.add_argument('--num_selected_features', type=int, default=1000, help='Number of fold-local SVM-RFE features to keep.')
+  parser.add_argument('--feature_representation', default=DEFAULT_FEATURE_REPRESENTATION, help='Connectivity representation to build before fold-local selection. Options: edge_vector, graph_summary')
   parser.add_argument('--selector_type', default='rfe', help='Feature selector to use inside each fold. Options: rfe, anova_f, mutual_info, logistic_l1')
   parser.add_argument('--model_type', default='ssae', help='Model to train on the selected features. Options: ssae, linear_svm, logistic_l1, logistic_elastic_net, hist_gradient_boosting')
   parser.add_argument('--ae1_hidden_size', type=int, default=500, help='Hidden size for the first autoencoder layer.')
@@ -3070,6 +3153,7 @@ if __name__ == "__main__":
   print("interpretation_methods: ", interpretation_methods)
   print("analyze_methods: ", analyze_methods)
   print("run_hyperparameter_sweep: ", run_hyperparameter_sweep_flag)
+  print("feature_representation: ", args.feature_representation)
   print("model_type: ", args.model_type)
   print("selector_type: ", args.selector_type)
   print("harmonization_method: ", args.harmonization_method)
@@ -3088,6 +3172,7 @@ if __name__ == "__main__":
     random_seed=DEFAULT_SEED,
     artifact_root=args.artifact_root,
     num_selected_features=args.num_selected_features,
+    feature_representation=args.feature_representation,
     selector_type=args.selector_type,
     model_type=args.model_type,
     ae1_epochs=args.ae1_epochs,

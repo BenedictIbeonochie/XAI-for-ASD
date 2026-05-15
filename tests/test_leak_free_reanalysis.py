@@ -21,6 +21,7 @@ from app.main import (
     build_confound_design_matrix,
     coerce_explanation_ranking,
     compute_fold_explanations,
+    get_feature_vecs,
     get_top_features_from_SVM_RFE,
     harmonize_feature_sets,
     load_legacy_selected_features,
@@ -97,6 +98,47 @@ class LeakFreeReanalysisTests(unittest.TestCase):
         self.assertEqual(selection.selected_feature_indices.shape, (5,))
         self.assertEqual(selection.selected_roi_pairs.shape, (5, 2))
         np.testing.assert_array_equal(selection.training_sample_indices, train_indices)
+
+    def test_graph_summary_representation_returns_roi_level_features(self):
+        data = [
+            np.array([
+                [1.0, 0.5, 0.1, -0.2],
+                [0.8, 0.4, 0.2, -0.1],
+                [0.7, 0.3, 0.1, 0.0],
+                [0.9, 0.6, 0.0, -0.3],
+            ], dtype=float),
+            np.array([
+                [0.2, -0.1, 0.7, 0.5],
+                [0.1, -0.2, 0.8, 0.6],
+                [0.0, -0.3, 0.6, 0.4],
+                [0.3, -0.1, 0.9, 0.7],
+            ], dtype=float),
+        ]
+
+        feature_vectors, feature_indices = get_feature_vecs(data, feature_representation="graph_summary")
+
+        self.assertEqual(feature_vectors.shape, (2, 24))
+        self.assertEqual(feature_indices.shape, (2, 24, 2))
+        self.assertTrue(np.isfinite(feature_vectors).all())
+        np.testing.assert_array_equal(feature_indices[0, :, 0], feature_indices[0, :, 1])
+
+    def test_graph_summary_representation_skips_edge_level_explanations(self):
+        config = self.make_fast_config(
+            'artifacts/test',
+            explanation_methods=('Integrated Gradients',),
+            feature_representation='graph_summary',
+        )
+
+        explanations = compute_fold_explanations(
+            model=None,
+            train_dataloader=None,
+            test_dataloader=None,
+            selected_roi_pairs=np.array([[0, 0], [1, 1]], dtype=int),
+            config=config,
+        )
+
+        self.assertIn('Integrated Gradients', explanations)
+        self.assertIn('edge_vector features', explanations['Integrated Gradients'].skipped_reason)
 
     def test_corrected_training_uses_outer_train_only_for_feature_selection(self):
         feature_vectors, labels, feature_indices = make_synthetic_feature_matrix()
