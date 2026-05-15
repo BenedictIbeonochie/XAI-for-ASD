@@ -14,18 +14,22 @@ from app.main import (
     Autoencoder,
     ExplanationRanking,
     ReanalysisConfig,
+    PipelineRunSummary,
     SoftmaxClassifier,
     StackedAutoencoder,
     build_hyperparameter_sweep_configs,
     build_dataloader,
     build_confound_design_matrix,
+    collect_reanalysis_logs,
     coerce_explanation_ranking,
     compute_fold_explanations,
     get_feature_vecs,
     get_top_features_from_SVM_RFE,
     harmonize_feature_sets,
     load_legacy_selected_features,
+    parse_reanalysis_log,
     regress_out_confounds,
+    run_repeated_evaluation,
     train_supervised_stage,
     train_and_eval_model,
 )
@@ -528,6 +532,86 @@ class LeakFreeReanalysisTests(unittest.TestCase):
             self.assertEqual(config.explanation_methods, ())
             self.assertFalse(config.save_model_checkpoints)
             self.assertIn(sweep_entry['name'], config.artifact_root)
+
+    def test_parse_reanalysis_log_extracts_metrics(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "dparsf_ssae.log"
+            log_path.write_text(
+                "\n".join([
+                    "feature_representation:  edge_vector",
+                    "model_type:  ssae",
+                    "selector_type:  rfe",
+                    "harmonization_method:  combat",
+                    "enable_confound_regression:  False",
+                    "Accuracy: 64.70%",
+                    "Specificity: 0.71",
+                    "Precision: 0.63",
+                    "F1_Score: 0.60",
+                    "dparsf: accuracy=0.6470 ± 0.0454, f1=0.6008 ± 0.0576",
+                ]),
+                encoding="utf-8",
+            )
+
+            record = parse_reanalysis_log(log_path)
+
+        self.assertEqual(record["pipeline"], "dparsf")
+        self.assertEqual(record["model_type"], "ssae")
+        self.assertEqual(record["harmonization_method"], "combat")
+        self.assertAlmostEqual(record["accuracy_mean"], 0.6470)
+        self.assertAlmostEqual(record["f1_mean"], 0.6008)
+
+    def test_collect_reanalysis_logs_sorts_best_accuracy_first(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            logs_dir = Path(temp_dir)
+            (logs_dir / "run_a.log").write_text(
+                "model_type:  linear_svm\ndparsf: accuracy=0.6100 ± 0.0200, f1=0.5800 ± 0.0300\n",
+                encoding="utf-8",
+            )
+            (logs_dir / "run_b.log").write_text(
+                "model_type:  ssae\ndparsf: accuracy=0.6400 ± 0.0100, f1=0.6000 ± 0.0200\n",
+                encoding="utf-8",
+            )
+
+            results_df = collect_reanalysis_logs(logs_dir)
+
+        self.assertEqual(list(results_df["log_name"]), ["run_b.log", "run_a.log"])
+
+    def test_run_repeated_evaluation_aggregates_runs(self):
+        base_config = self.make_fast_config("artifacts/reanalysis", explanation_methods=())
+
+        def make_summary(seed):
+            config = ReanalysisConfig(**vars(base_config))
+            config.random_seed = seed
+            config.artifact_root = f"artifacts/repeated/{seed}"
+            return PipelineRunSummary(
+                pipeline="synthetic",
+                config=config,
+                fold_results=[],
+                metrics_summary={
+                    "accuracy": {"mean": 0.60 + (seed % 2) * 0.01, "std": 0.01, "values": []},
+                    "sensitivity": {"mean": 0.60, "std": 0.01, "values": []},
+                    "specificity": {"mean": 0.61, "std": 0.01, "values": []},
+                    "precision": {"mean": 0.59, "std": 0.01, "values": []},
+                    "f1": {"mean": 0.58 + (seed % 2) * 0.01, "std": 0.01, "values": []},
+                },
+                interpretation_summary={},
+                artifact_dir=config.artifact_root,
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("app.main.run_pipeline_reanalysis", side_effect=lambda pipeline, verbose, config: make_summary(config.random_seed)):
+                repeat_df, aggregate_summary, repeat_records = run_repeated_evaluation(
+                    "synthetic",
+                    base_config,
+                    Path(temp_dir),
+                    num_repeats=3,
+                    verbose=False,
+                )
+
+        self.assertEqual(len(repeat_df), 3)
+        self.assertEqual(len(repeat_records), 3)
+        self.assertEqual(aggregate_summary["num_repeats"], 3)
+        self.assertIn("accuracy_across_repeats_mean", aggregate_summary)
 
 
 if __name__ == '__main__':

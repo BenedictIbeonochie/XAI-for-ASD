@@ -1137,6 +1137,28 @@ def write_json_file(path, payload):
   ensure_directory(path.parent)
   with open(path, 'w', encoding='utf-8') as json_file:
     json.dump(to_serializable(payload), json_file, indent=2)
+
+
+def build_summary_row(summary, config_name=None, repeat_index=None):
+  config = summary.config
+  return {
+    'config_name': config_name or summary.pipeline,
+    'repeat_index': repeat_index,
+    'pipeline': summary.pipeline,
+    'feature_representation': config.feature_representation,
+    'model_type': config.model_type,
+    'selector_type': config.selector_type,
+    'harmonization_method': config.harmonization_method,
+    'enable_confound_regression': bool(config.enable_confound_regression),
+    'num_selected_features': int(config.num_selected_features),
+    'accuracy_mean': float(summary.metrics_summary['accuracy']['mean']),
+    'accuracy_std': float(summary.metrics_summary['accuracy']['std']),
+    'f1_mean': float(summary.metrics_summary['f1']['mean']),
+    'f1_std': float(summary.metrics_summary['f1']['std']),
+    'specificity_mean': float(summary.metrics_summary['specificity']['mean']),
+    'precision_mean': float(summary.metrics_summary['precision']['mean']),
+    'artifact_dir': summary.artifact_dir,
+  }
   
 
 def clone_module_state(module):
@@ -2767,19 +2789,8 @@ def run_hyperparameter_sweep(pipeline, base_config, sweep_configs, sweep_root, v
     summary = run_pipeline_reanalysis(pipeline, verbose=verbose, config=config)
 
     row = {
-      'config_name': config_name,
-      'feature_representation': config.feature_representation,
-      'model_type': config.model_type,
-      'selector_type': config.selector_type,
-      'enable_confound_regression': bool(config.enable_confound_regression),
+      **build_summary_row(summary, config_name=config_name),
       **sweep_entry['parameters'],
-      'accuracy_mean': float(summary.metrics_summary['accuracy']['mean']),
-      'accuracy_std': float(summary.metrics_summary['accuracy']['std']),
-      'f1_mean': float(summary.metrics_summary['f1']['mean']),
-      'f1_std': float(summary.metrics_summary['f1']['std']),
-      'specificity_mean': float(summary.metrics_summary['specificity']['mean']),
-      'precision_mean': float(summary.metrics_summary['precision']['mean']),
-      'artifact_dir': summary.artifact_dir,
       'fold_selected_feature_counts': [int(fold_result.selected_feature_count) for fold_result in summary.fold_results],
     }
     sweep_rows.append(row)
@@ -2800,6 +2811,142 @@ def run_hyperparameter_sweep(pipeline, base_config, sweep_configs, sweep_root, v
   write_json_file(sweep_root / 'results.json', sweep_rows)
 
   return sweep_df, sweep_records
+
+
+def run_repeated_evaluation(pipeline, base_config, repeat_root, num_repeats=5, verbose=False):
+  repeat_root = ensure_directory(repeat_root)
+  repeat_rows = []
+  repeat_records = []
+
+  for repeat_index in range(1, int(num_repeats) + 1):
+    repeat_config = ReanalysisConfig(**asdict(base_config))
+    repeat_config.random_seed = int(base_config.random_seed) + (repeat_index - 1) * 1009
+    repeat_config.artifact_root = str(repeat_root / f'repeat_{repeat_index:02d}')
+
+    if verbose:
+      print("\n" + "-" * 100)
+      print(f"Repeated evaluation {repeat_index}/{num_repeats} for pipeline '{pipeline}'")
+      print(f"Seed: {repeat_config.random_seed}")
+      print("-" * 100)
+
+    summary = run_pipeline_reanalysis(pipeline, verbose=verbose, config=repeat_config)
+    row = build_summary_row(summary, config_name=f'repeat_{repeat_index:02d}', repeat_index=repeat_index)
+    row['random_seed'] = int(repeat_config.random_seed)
+    repeat_rows.append(row)
+    repeat_records.append({
+      'repeat_index': repeat_index,
+      'random_seed': int(repeat_config.random_seed),
+      'summary': summary,
+    })
+
+  repeat_df = pd.DataFrame(repeat_rows)
+  aggregate_summary = {
+    'pipeline': pipeline,
+    'num_repeats': int(num_repeats),
+    'accuracy_across_repeats_mean': float(repeat_df['accuracy_mean'].mean()) if not repeat_df.empty else None,
+    'accuracy_across_repeats_std': float(repeat_df['accuracy_mean'].std(ddof=0)) if not repeat_df.empty else None,
+    'f1_across_repeats_mean': float(repeat_df['f1_mean'].mean()) if not repeat_df.empty else None,
+    'f1_across_repeats_std': float(repeat_df['f1_mean'].std(ddof=0)) if not repeat_df.empty else None,
+    'best_repeat': repeat_df.sort_values(['accuracy_mean', 'f1_mean'], ascending=[False, False]).iloc[0].to_dict() if not repeat_df.empty else None,
+  }
+
+  repeat_df.to_csv(repeat_root / 'repeated_results.csv', index=False)
+  write_json_file(repeat_root / 'repeated_results.json', repeat_rows)
+  write_json_file(repeat_root / 'aggregate_summary.json', aggregate_summary)
+
+  return repeat_df, aggregate_summary, repeat_records
+
+
+def parse_key_value_line(line):
+  if ':' not in line:
+    return None, None
+  key, value = line.split(':', 1)
+  return key.strip(), value.strip()
+
+
+def parse_bool_or_string(value):
+  normalized = str(value).strip().lower()
+  if normalized == 'true':
+    return True
+  if normalized == 'false':
+    return False
+  return value.strip()
+
+
+def parse_reanalysis_log(log_path):
+  log_path = Path(log_path)
+  if not log_path.exists():
+    raise FileNotFoundError(log_path)
+
+  config_keys = {
+    'feature_representation',
+    'model_type',
+    'selector_type',
+    'harmonization_method',
+    'enable_confound_regression',
+    'interpretation_methods',
+    'run_hyperparameter_sweep',
+  }
+  record = {
+    'log_name': log_path.name,
+    'log_path': str(log_path),
+  }
+
+  with open(log_path, 'r', encoding='utf-8', errors='replace') as handle:
+    for raw_line in handle:
+      line = raw_line.strip()
+      if not line:
+        continue
+
+      key, value = parse_key_value_line(line)
+      if key in config_keys:
+        record[key] = parse_bool_or_string(value)
+
+      if line.startswith('Accuracy: '):
+        record['accuracy_percent'] = float(line.replace('Accuracy:', '').replace('%', '').strip())
+      elif line.startswith('Specificity: '):
+        record['specificity'] = float(line.replace('Specificity:', '').strip())
+      elif line.startswith('Precision: '):
+        record['precision'] = float(line.replace('Precision:', '').strip())
+      elif line.startswith('F1_Score: '):
+        record['f1_score'] = float(line.replace('F1_Score:', '').strip())
+      elif ': accuracy=' in line and '±' in line:
+        pipeline_name, metrics_text = line.split(': accuracy=', 1)
+        accuracy_text, f1_text = metrics_text.split(', f1=')
+        accuracy_mean, accuracy_std = [part.strip() for part in accuracy_text.split('±', 1)]
+        f1_mean, f1_std = [part.strip() for part in f1_text.split('±', 1)]
+        record['pipeline'] = pipeline_name.strip()
+        record['accuracy_mean'] = float(accuracy_mean)
+        record['accuracy_std'] = float(accuracy_std)
+        record['f1_mean'] = float(f1_mean)
+        record['f1_std'] = float(f1_std)
+
+  return record
+
+
+def collect_reanalysis_logs(logs_dir, pattern='*.log'):
+  logs_dir = Path(logs_dir)
+  records = []
+
+  for log_path in sorted(logs_dir.glob(pattern)):
+    try:
+      record = parse_reanalysis_log(log_path)
+    except Exception as error:
+      records.append({
+        'log_name': log_path.name,
+        'log_path': str(log_path),
+        'parse_error': str(error),
+      })
+      continue
+
+    if 'accuracy_mean' in record:
+      records.append(record)
+
+  results_df = pd.DataFrame(records)
+  if not results_df.empty and 'accuracy_mean' in results_df.columns:
+    results_df = results_df.sort_values(['accuracy_mean', 'f1_mean'], ascending=[False, False], na_position='last').reset_index(drop=True)
+
+  return results_df
 
 
 def run_pipeline_reanalysis(pipeline, verbose=False, config=None):
@@ -3126,6 +3273,9 @@ if __name__ == "__main__":
   parser.add_argument('--harmonization_covariates', nargs='*', default=list(DEFAULT_HARMONIZATION_COVARIATES), help='Covariates to preserve during harmonization. Options: age, sex')
   parser.add_argument('--use_feature_scaling', type=lambda x: (str(x).lower() == 'true'), default=True, help='Scale selected features inside each fold using training data only.')
   parser.add_argument('--run_hyperparameter_sweep', type=lambda x: (str(x).lower() == 'true'), default=False, help='Run a series of fixed, leak-free configurations and save a comparison table.')
+  parser.add_argument('--run_repeated_evaluation', type=lambda x: (str(x).lower() == 'true'), default=False, help='Repeat the full leak-free evaluation multiple times with different seeds to quantify stability.')
+  parser.add_argument('--num_repeats', type=int, default=5, help='Number of repeated full evaluations to run when --run_repeated_evaluation is enabled.')
+  parser.add_argument('--repeat_name', default='repeated_evaluation', help='Artifact subdirectory name for repeated full evaluations.')
   parser.add_argument('--sweep_name', default='hyperparameter_sweep', help='Artifact subdirectory name for the fixed-configuration sweep summary.')
   parser.add_argument('--sweep_feature_counts', nargs='*', type=int, default=None, help='Feature-count values to compare across full leak-free runs.')
   parser.add_argument('--sweep_ae1_hidden_sizes', nargs='*', type=int, default=None, help='AE1 hidden sizes to compare across full leak-free runs.')
@@ -3137,6 +3287,9 @@ if __name__ == "__main__":
   parser.add_argument('--max_sweep_configs', type=int, default=24, help='Safety cap on the number of fixed-configuration sweep combinations.')
   parser.add_argument('--run_permutation_test', type=lambda x: (str(x).lower() == 'true'), default=False, help='Run the corrected CCS permutation test.')
   parser.add_argument('--num_permutations', type=int, default=100, help='Number of label permutations for the corrected CCS permutation test.')
+  parser.add_argument('--collect_results_from_logs', type=lambda x: (str(x).lower() == 'true'), default=False, help='Parse completed reanalysis logs into a comparison CSV without rerunning experiments.')
+  parser.add_argument('--logs_dir', default='run_logs', help='Directory containing reanalysis logs to parse when --collect_results_from_logs is enabled.')
+  parser.add_argument('--results_table_output', default='artifacts/reanalysis/log_summaries/results_table.csv', help='Output CSV path for parsed log summaries.')
 
   args = parser.parse_args()
 
@@ -3146,6 +3299,8 @@ if __name__ == "__main__":
   interpretation_methods = args.interpretation_methods
   analyze_methods = args.analyze_methods
   run_hyperparameter_sweep_flag = args.run_hyperparameter_sweep
+  run_repeated_evaluation_flag = args.run_repeated_evaluation
+  collect_results_from_logs_flag = args.collect_results_from_logs
 
   print("verbose: ", verbose)
   print("train_model: ", train_model)
@@ -3153,6 +3308,8 @@ if __name__ == "__main__":
   print("interpretation_methods: ", interpretation_methods)
   print("analyze_methods: ", analyze_methods)
   print("run_hyperparameter_sweep: ", run_hyperparameter_sweep_flag)
+  print("run_repeated_evaluation: ", run_repeated_evaluation_flag)
+  print("collect_results_from_logs: ", collect_results_from_logs_flag)
   print("feature_representation: ", args.feature_representation)
   print("model_type: ", args.model_type)
   print("selector_type: ", args.selector_type)
@@ -3160,12 +3317,30 @@ if __name__ == "__main__":
   print("enable_confound_regression: ", args.enable_confound_regression)
   print("Torch Cuda is Available =", use_cuda)
 
+  if collect_results_from_logs_flag:
+    results_df = collect_reanalysis_logs(args.logs_dir)
+    output_path = Path(args.results_table_output)
+    ensure_directory(output_path.parent)
+    results_df.to_csv(output_path, index=False)
+    if results_df.empty:
+      print(f"No completed reanalysis logs with final metrics were found in '{args.logs_dir}'.")
+    else:
+      print(results_df.to_string(index=False))
+      print(f"\nSaved results table to {output_path}")
+    print("Seed is", DEFAULT_SEED)
+    raise SystemExit(0)
+
   if not train_model:
     raise RuntimeError("Correction mode requires fold-specific retraining. Legacy checkpoint loading is disabled.")
   if analyze_methods:
     raise RuntimeError("ROAR is disabled in the corrected workflow. Re-run ROAR from fold-specific corrected artifacts instead.")
-  if run_hyperparameter_sweep_flag and args.run_permutation_test:
-    raise RuntimeError("Run the hyperparameter sweep and the permutation test separately to keep artifacts and runtime manageable.")
+  mutually_exclusive_modes = [
+    run_hyperparameter_sweep_flag,
+    run_repeated_evaluation_flag,
+    args.run_permutation_test,
+  ]
+  if sum(bool(flag) for flag in mutually_exclusive_modes) > 1:
+    raise RuntimeError("Run the hyperparameter sweep, repeated evaluation, and permutation test separately to keep artifacts and runtime manageable.")
 
   selected_methods = DEFAULT_INTERPRETATION_METHODS if interpretation_methods else ()
   base_config = ReanalysisConfig(
@@ -3249,6 +3424,25 @@ if __name__ == "__main__":
       else:
         print("\nBest sweep results\n")
         print(sweep_df.head(10).to_string(index=False))
+      continue
+
+    if run_repeated_evaluation_flag:
+      repeat_root = ensure_directory(Path(args.artifact_root) / 'repeated_evaluations' / pipeline / args.repeat_name)
+      print(f"\nRunning repeated leak-free evaluation for pipeline '{pipeline}' with {args.num_repeats} repeats")
+      repeat_df, aggregate_summary, _ = run_repeated_evaluation(
+        pipeline,
+        base_config,
+        repeat_root,
+        num_repeats=args.num_repeats,
+        verbose=verbose,
+      )
+      if repeat_df.empty:
+        print(f"No repeated-evaluation results were produced for pipeline '{pipeline}'.")
+      else:
+        print("\nRepeated evaluation results\n")
+        print(repeat_df.to_string(index=False))
+        print("\nAggregate summary\n")
+        print(json.dumps(aggregate_summary, indent=2))
       continue
 
     print(f"\nRunning corrected reanalysis for pipeline '{pipeline}'")
