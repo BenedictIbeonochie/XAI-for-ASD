@@ -62,6 +62,10 @@ DEFAULT_CONFOUND_VARIABLES = (
   "age",
   "sex",
 )
+DEFAULT_HARMONIZATION_COVARIATES = (
+  "age",
+  "sex",
+)
 
 
 def parse_optional_float(value):
@@ -279,6 +283,8 @@ class ReanalysisConfig:
   hist_gradient_learning_rate: float = 0.1
   hist_gradient_max_depth: int | None = 3
   hist_gradient_max_iter: int = 200
+  harmonization_method: str = "none"
+  harmonization_covariates: tuple[str, ...] = DEFAULT_HARMONIZATION_COVARIATES
   enable_confound_regression: bool = False
   confound_variables: tuple[str, ...] = DEFAULT_CONFOUND_VARIABLES
   random_seed: int = DEFAULT_SEED
@@ -623,6 +629,308 @@ def regress_out_confounds(train_features, train_metadata, config, *other_feature
   }
 
   return residualized_train, residualized_others, confound_summary
+
+
+def normalize_harmonization_covariates(covariates):
+  normalized_covariates = []
+  for covariate in covariates or ():
+    covariate = str(covariate).strip().lower()
+    if covariate in {'age', 'sex'} and covariate not in normalized_covariates:
+      normalized_covariates.append(covariate)
+  return tuple(normalized_covariates)
+
+
+def build_harmonization_covariate_matrix(
+  subject_metadata,
+  covariates,
+  age_mean=None,
+  age_scale=None,
+  sex_mean=None,
+  sex_scale=None,
+):
+  metadata = prepare_subject_metadata(subject_metadata)
+  covariates = normalize_harmonization_covariates(covariates)
+  num_samples = len(metadata)
+
+  columns = []
+  column_names = []
+  summary = {
+    'covariates': list(covariates),
+    'age_mean': None,
+    'age_scale': None,
+    'sex_mean': None,
+    'sex_scale': None,
+  }
+
+  if 'age' in covariates:
+    age_values = pd.to_numeric(metadata['age_at_scan'], errors='coerce').to_numpy(dtype=float)
+    if age_mean is None:
+      age_mean = float(np.nanmean(age_values)) if not np.all(np.isnan(age_values)) else 0.0
+    if age_scale is None:
+      age_scale = float(np.nanstd(age_values)) if not np.all(np.isnan(age_values)) else 1.0
+    if age_scale == 0:
+      age_scale = 1.0
+    age_filled = np.where(np.isnan(age_values), age_mean, age_values)
+    columns.append(((age_filled - age_mean) / age_scale).reshape(num_samples, 1))
+    column_names.append('age_at_scan')
+    summary['age_mean'] = float(age_mean)
+    summary['age_scale'] = float(age_scale)
+
+  if 'sex' in covariates:
+    sex_values = pd.to_numeric(metadata['sex'], errors='coerce').to_numpy(dtype=float)
+    if sex_mean is None:
+      sex_mean = float(np.nanmean(sex_values)) if not np.all(np.isnan(sex_values)) else 0.0
+    if sex_scale is None:
+      sex_scale = float(np.nanstd(sex_values)) if not np.all(np.isnan(sex_values)) else 1.0
+    if sex_scale == 0:
+      sex_scale = 1.0
+    sex_filled = np.where(np.isnan(sex_values), sex_mean, sex_values)
+    columns.append(((sex_filled - sex_mean) / sex_scale).reshape(num_samples, 1))
+    column_names.append('sex')
+    summary['sex_mean'] = float(sex_mean)
+    summary['sex_scale'] = float(sex_scale)
+
+  if columns:
+    covariate_matrix = np.hstack(columns)
+  else:
+    covariate_matrix = np.empty((num_samples, 0), dtype=float)
+
+  return covariate_matrix, column_names, summary
+
+
+def get_harmonization_sites(subject_metadata):
+  metadata = prepare_subject_metadata(subject_metadata)
+  return metadata['site_id'].fillna('UNKNOWN').astype(str).replace('', 'UNKNOWN').to_numpy()
+
+
+def compute_inverse_gamma_moments(values):
+  values = np.asarray(values, dtype=float)
+  mean_value = float(np.mean(values))
+  variance_value = float(np.var(values, ddof=1)) if len(values) > 1 else 0.0
+
+  if variance_value <= 1e-8:
+    variance_value = max((mean_value ** 2) * 1e-3, 1e-6)
+
+  a_prior = (2 * variance_value + mean_value ** 2) / variance_value
+  b_prior = (mean_value * variance_value + mean_value ** 3) / variance_value
+  return float(a_prior), float(b_prior)
+
+
+def iterative_combat_solution(s_data_batch, gamma_hat, delta_hat, gamma_bar, t2, a_prior, b_prior, convergence=1e-4, max_iter=100):
+  num_batch_samples = s_data_batch.shape[1]
+  gamma_old = np.asarray(gamma_hat, dtype=float)
+  delta_old = np.asarray(delta_hat, dtype=float)
+  t2 = max(float(t2), 1e-8)
+
+  for _ in range(max_iter):
+    gamma_new = (t2 * num_batch_samples * gamma_hat + delta_old * gamma_bar) / (t2 * num_batch_samples + delta_old)
+    residual_sum_squares = np.sum((s_data_batch - gamma_new[:, None]) ** 2, axis=1)
+    delta_new = (0.5 * residual_sum_squares + b_prior) / (num_batch_samples / 2.0 + a_prior - 1.0)
+
+    gamma_denominator = np.maximum(np.abs(gamma_old), 1e-8)
+    delta_denominator = np.maximum(np.abs(delta_old), 1e-8)
+    max_change = max(
+      float(np.max(np.abs((gamma_new - gamma_old) / gamma_denominator))),
+      float(np.max(np.abs((delta_new - delta_old) / delta_denominator))),
+    )
+
+    gamma_old = gamma_new
+    delta_old = delta_new
+
+    if max_change < convergence:
+      break
+
+  return gamma_old, np.maximum(delta_old, 1e-8)
+
+
+def fit_combat_harmonizer(train_features, train_metadata, covariates):
+  train_features = sanitize_feature_matrix(train_features)
+  train_metadata = prepare_subject_metadata(train_metadata)
+  covariates = normalize_harmonization_covariates(covariates)
+
+  sites = get_harmonization_sites(train_metadata)
+  site_categories = tuple(sorted(pd.unique(sites)))
+  if len(site_categories) < 2:
+    return {
+      'enabled': False,
+      'reason': 'combat_requires_multiple_sites',
+      'site_categories': list(site_categories),
+      'covariates': list(covariates),
+    }
+
+  covariate_matrix, covariate_columns, covariate_summary = build_harmonization_covariate_matrix(
+    train_metadata,
+    covariates,
+  )
+  batch_design = pd.get_dummies(pd.Categorical(sites, categories=site_categories), dtype=float).to_numpy(dtype=float)
+  design_matrix = np.hstack([batch_design, covariate_matrix]) if covariate_matrix.size else batch_design
+
+  feature_matrix = train_features.T  # features x samples
+  coefficient_hat = np.linalg.pinv(design_matrix) @ feature_matrix.T  # design x features
+  num_batches = batch_design.shape[1]
+  batch_coefficients = coefficient_hat[:num_batches, :]
+  covariate_coefficients = coefficient_hat[num_batches:, :] if covariate_matrix.size else np.empty((0, feature_matrix.shape[0]), dtype=float)
+
+  batch_counts = batch_design.sum(axis=0)
+  grand_mean = (batch_counts / batch_counts.sum()) @ batch_coefficients
+  covariate_effect = (covariate_matrix @ covariate_coefficients).T if covariate_coefficients.size else np.zeros_like(feature_matrix)
+  stand_mean = grand_mean[:, None] + covariate_effect
+
+  fitted_values = (design_matrix @ coefficient_hat).T
+  residuals = feature_matrix - fitted_values
+  var_pooled = np.mean(residuals ** 2, axis=1)
+  var_pooled = np.maximum(var_pooled, 1e-8)
+
+  s_data = (feature_matrix - stand_mean) / np.sqrt(var_pooled[:, None])
+  gamma_hat = np.linalg.pinv(batch_design) @ s_data.T
+  delta_hat = []
+  gamma_star = []
+  delta_star = []
+
+  for batch_index, site in enumerate(site_categories):
+    batch_mask = sites == site
+    batch_s_data = s_data[:, batch_mask]
+    batch_gamma_hat = gamma_hat[batch_index, :]
+    if batch_s_data.shape[1] > 1:
+      batch_delta_hat = np.var(batch_s_data, axis=1, ddof=1)
+    else:
+      batch_delta_hat = np.var(batch_s_data, axis=1)
+    batch_delta_hat = np.maximum(batch_delta_hat, 1e-8)
+
+    gamma_bar = float(np.mean(batch_gamma_hat))
+    t2 = float(np.var(batch_gamma_hat, ddof=1)) if batch_gamma_hat.shape[0] > 1 else 1e-8
+    if t2 <= 1e-8:
+      t2 = 1e-8
+    a_prior, b_prior = compute_inverse_gamma_moments(batch_delta_hat)
+    batch_gamma_star, batch_delta_star = iterative_combat_solution(
+      batch_s_data,
+      batch_gamma_hat,
+      batch_delta_hat,
+      gamma_bar,
+      t2,
+      a_prior,
+      b_prior,
+    )
+    delta_hat.append(batch_delta_hat)
+    gamma_star.append(batch_gamma_star)
+    delta_star.append(batch_delta_star)
+
+  gamma_star = np.asarray(gamma_star, dtype=float)
+  delta_star = np.asarray(delta_star, dtype=float)
+
+  return {
+    'enabled': True,
+    'site_categories': list(site_categories),
+    'covariates': list(covariates),
+    'covariate_columns': covariate_columns,
+    'covariate_summary': covariate_summary,
+    'grand_mean': grand_mean,
+    'var_pooled': var_pooled,
+    'covariate_coefficients': covariate_coefficients,
+    'gamma_star': gamma_star,
+    'delta_star': delta_star,
+  }
+
+
+def apply_combat_harmonizer(features, subject_metadata, harmonizer):
+  features = sanitize_feature_matrix(features)
+  if not harmonizer.get('enabled'):
+    return features, {
+      'enabled': False,
+      'reason': harmonizer.get('reason', 'combat_disabled'),
+      'unseen_sites': [],
+    }
+
+  subject_metadata = prepare_subject_metadata(subject_metadata)
+  covariate_matrix, _, _ = build_harmonization_covariate_matrix(
+    subject_metadata,
+    harmonizer['covariates'],
+    age_mean=harmonizer['covariate_summary']['age_mean'],
+    age_scale=harmonizer['covariate_summary']['age_scale'],
+    sex_mean=harmonizer['covariate_summary']['sex_mean'],
+    sex_scale=harmonizer['covariate_summary']['sex_scale'],
+  )
+
+  feature_matrix = features.T
+  covariate_coefficients = np.asarray(harmonizer['covariate_coefficients'], dtype=float)
+  if covariate_coefficients.size:
+    covariate_effect = (covariate_matrix @ covariate_coefficients).T
+  else:
+    covariate_effect = np.zeros_like(feature_matrix)
+
+  stand_mean = np.asarray(harmonizer['grand_mean'], dtype=float)[:, None] + covariate_effect
+  s_data = (feature_matrix - stand_mean) / np.sqrt(np.asarray(harmonizer['var_pooled'], dtype=float)[:, None])
+  adjusted = np.array(s_data, copy=True)
+
+  sites = get_harmonization_sites(subject_metadata)
+  site_lookup = {site: index for index, site in enumerate(harmonizer['site_categories'])}
+  unseen_sites = sorted({site for site in sites if site not in site_lookup})
+
+  for site, batch_index in site_lookup.items():
+    batch_mask = sites == site
+    if not np.any(batch_mask):
+      continue
+    gamma = harmonizer['gamma_star'][batch_index, :]
+    delta = harmonizer['delta_star'][batch_index, :]
+    adjusted[:, batch_mask] = (adjusted[:, batch_mask] - gamma[:, None]) / np.sqrt(delta[:, None])
+
+  harmonized = adjusted * np.sqrt(np.asarray(harmonizer['var_pooled'], dtype=float)[:, None]) + stand_mean
+  return harmonized.T, {
+    'enabled': True,
+    'unseen_sites': unseen_sites,
+  }
+
+
+def harmonize_feature_sets(train_features, train_metadata, config, *other_feature_metadata_pairs):
+  train_features = sanitize_feature_matrix(train_features)
+  other_feature_metadata_pairs = [
+    (sanitize_feature_matrix(features), metadata)
+    for features, metadata in other_feature_metadata_pairs
+  ]
+
+  harmonization_method = str(config.harmonization_method).strip().lower()
+  if harmonization_method in ('', 'none'):
+    harmonization_summary = {
+      'enabled': False,
+      'method': 'none',
+      'unseen_sites': [],
+    }
+    return train_features, [features for features, _ in other_feature_metadata_pairs], harmonization_summary
+
+  if harmonization_method != 'combat':
+    raise ValueError(
+      f"Unknown harmonization_method '{config.harmonization_method}'. "
+      "Supported options: none, combat."
+    )
+
+  harmonizer = fit_combat_harmonizer(
+    train_features,
+    train_metadata,
+    config.harmonization_covariates,
+  )
+  harmonized_train, train_application_summary = apply_combat_harmonizer(
+    train_features,
+    train_metadata,
+    harmonizer,
+  )
+
+  transformed_sets = []
+  unseen_sites = list(train_application_summary.get('unseen_sites', []))
+  for features, metadata in other_feature_metadata_pairs:
+    harmonized_features, application_summary = apply_combat_harmonizer(features, metadata, harmonizer)
+    transformed_sets.append(harmonized_features)
+    unseen_sites.extend(application_summary.get('unseen_sites', []))
+
+  harmonization_summary = {
+    'enabled': bool(harmonizer.get('enabled')),
+    'method': 'combat',
+    'covariates': list(normalize_harmonization_covariates(config.harmonization_covariates)),
+    'site_categories': harmonizer.get('site_categories', []),
+    'unseen_sites': sorted(set(unseen_sites)),
+    'reason': harmonizer.get('reason'),
+  }
+
+  return harmonized_train, transformed_sets, harmonization_summary
 
 
 def get_candidate_feature_counts(config, max_feature_count):
@@ -1776,11 +2084,17 @@ def select_feature_count_for_fold(feature_vectors, labels_from_abide, roi_lookup
 
   train_metadata = subject_metadata.iloc[train_indices] if subject_metadata is not None else None
   validation_metadata = subject_metadata.iloc[validation_indices] if subject_metadata is not None else None
-  candidate_train_base_features, [candidate_validation_base_features], confound_summary = regress_out_confounds(
+  candidate_train_harmonized_features, [candidate_validation_harmonized_features], harmonization_summary = harmonize_feature_sets(
     feature_vectors[train_indices],
     train_metadata,
     config,
     (feature_vectors[validation_indices], validation_metadata),
+  )
+  candidate_train_base_features, [candidate_validation_base_features], confound_summary = regress_out_confounds(
+    candidate_train_harmonized_features,
+    train_metadata,
+    config,
+    (candidate_validation_harmonized_features, validation_metadata),
   )
 
   for feature_count in candidate_feature_counts:
@@ -1826,6 +2140,7 @@ def select_feature_count_for_fold(feature_vectors, labels_from_abide, roi_lookup
       'selection_training_sample_indices': np.asarray(train_indices, dtype=int),
       'validation_metrics': candidate_metrics,
       'training_summary': candidate_training_summary,
+      'harmonization_summary': harmonization_summary,
       'confound_summary': confound_summary,
     })
 
@@ -2079,6 +2394,8 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
 
   if feature_vectors.ndim != 2:
     raise ValueError("feature_vectors must be a 2D array of shape (samples, features).")
+  if str(config.harmonization_method).strip().lower() not in {'', 'none'} and config.enable_confound_regression:
+    raise ValueError("Use either ComBat harmonization or confound regression, not both in the same run.")
 
   set_random_seed(config.random_seed)
   skf = StratifiedKFold(n_splits=config.n_splits, shuffle=True, random_state=config.random_seed)
@@ -2119,13 +2436,21 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
     validation_metadata = subject_metadata.iloc[validation_indices] if subject_metadata is not None else None
     test_metadata = subject_metadata.iloc[test_indices] if subject_metadata is not None else None
 
-    outer_train_selection_features, [train_base_features, validation_base_features, test_base_features], confound_summary = regress_out_confounds(
+    outer_train_harmonized_features, [train_harmonized_features, validation_harmonized_features, test_harmonized_features], harmonization_summary = harmonize_feature_sets(
       feature_vectors[outer_train_indices],
       outer_train_metadata,
       config,
       (feature_vectors[train_indices], train_metadata),
       (feature_vectors[validation_indices], validation_metadata),
       (feature_vectors[test_indices], test_metadata),
+    )
+    outer_train_selection_features, [train_base_features, validation_base_features, test_base_features], confound_summary = regress_out_confounds(
+      outer_train_harmonized_features,
+      outer_train_metadata,
+      config,
+      (train_harmonized_features, train_metadata),
+      (validation_harmonized_features, validation_metadata),
+      (test_harmonized_features, test_metadata),
     )
 
     selection = get_top_features_from_selector(
@@ -2211,7 +2536,10 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
       scaler_scale=np.asarray(scaling_summary['scale'], dtype=float),
       feature_count_tuning_records=feature_count_tuning_records,
       training_summary=training_summary,
-      confound_summary=confound_summary,
+      confound_summary={
+        'harmonization': harmonization_summary,
+        'confound_regression': confound_summary,
+      },
       explanation_rankings=explanation_rankings,
       artifact_dir=str(fold_artifact_dir) if fold_artifact_dir is not None else None,
       model_checkpoint_path=str(model_checkpoint_path) if model_checkpoint_path is not None else None,
@@ -2711,6 +3039,8 @@ if __name__ == "__main__":
   parser.add_argument('--hist_gradient_learning_rate', type=float, default=0.1, help='Learning rate for the histogram gradient boosting baseline.')
   parser.add_argument('--hist_gradient_max_depth', type=int, default=3, help='Maximum tree depth for the histogram gradient boosting baseline.')
   parser.add_argument('--hist_gradient_max_iter', type=int, default=200, help='Maximum number of boosting iterations for the histogram gradient boosting baseline.')
+  parser.add_argument('--harmonization_method', default='none', help='Optional leak-free harmonization stage fit on the training fold only. Options: none, combat')
+  parser.add_argument('--harmonization_covariates', nargs='*', default=list(DEFAULT_HARMONIZATION_COVARIATES), help='Covariates to preserve during harmonization. Options: age, sex')
   parser.add_argument('--use_feature_scaling', type=lambda x: (str(x).lower() == 'true'), default=True, help='Scale selected features inside each fold using training data only.')
   parser.add_argument('--run_hyperparameter_sweep', type=lambda x: (str(x).lower() == 'true'), default=False, help='Run a series of fixed, leak-free configurations and save a comparison table.')
   parser.add_argument('--sweep_name', default='hyperparameter_sweep', help='Artifact subdirectory name for the fixed-configuration sweep summary.')
@@ -2742,6 +3072,7 @@ if __name__ == "__main__":
   print("run_hyperparameter_sweep: ", run_hyperparameter_sweep_flag)
   print("model_type: ", args.model_type)
   print("selector_type: ", args.selector_type)
+  print("harmonization_method: ", args.harmonization_method)
   print("enable_confound_regression: ", args.enable_confound_regression)
   print("Torch Cuda is Available =", use_cuda)
 
@@ -2784,6 +3115,8 @@ if __name__ == "__main__":
     hist_gradient_learning_rate=args.hist_gradient_learning_rate,
     hist_gradient_max_depth=args.hist_gradient_max_depth,
     hist_gradient_max_iter=args.hist_gradient_max_iter,
+    harmonization_method=args.harmonization_method,
+    harmonization_covariates=tuple(args.harmonization_covariates or ()),
     enable_confound_regression=args.enable_confound_regression,
     confound_variables=tuple(args.confound_variables or ()),
     use_feature_scaling=args.use_feature_scaling,

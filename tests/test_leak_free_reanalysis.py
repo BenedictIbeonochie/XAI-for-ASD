@@ -22,6 +22,7 @@ from app.main import (
     coerce_explanation_ranking,
     compute_fold_explanations,
     get_top_features_from_SVM_RFE,
+    harmonize_feature_sets,
     load_legacy_selected_features,
     regress_out_confounds,
     train_supervised_stage,
@@ -359,6 +360,75 @@ class LeakFreeReanalysisTests(unittest.TestCase):
         self.assertEqual(len(summary.fold_results), 5)
         self.assertIn("accuracy", summary.metrics_summary)
         self.assertEqual(summary.fold_results[0].training_summary["model_type"], "linear_svm")
+
+    def test_combat_harmonization_uses_training_subset_only(self):
+        train_features = np.array([
+            [10.0, 1.0],
+            [11.0, 1.5],
+            [20.0, 1.2],
+            [21.0, 1.7],
+        ])
+        test_features = np.array([
+            [12.0, 1.1],
+            [22.0, 1.6],
+        ])
+        train_metadata = pd.DataFrame([
+            {"file_id": "a", "site_id": "SITE_A", "age_at_scan": 10.0, "sex": 1.0},
+            {"file_id": "b", "site_id": "SITE_A", "age_at_scan": 11.0, "sex": 2.0},
+            {"file_id": "c", "site_id": "SITE_B", "age_at_scan": 12.0, "sex": 1.0},
+            {"file_id": "d", "site_id": "SITE_B", "age_at_scan": 13.0, "sex": 2.0},
+        ])
+        test_metadata = pd.DataFrame([
+            {"file_id": "e", "site_id": "SITE_A", "age_at_scan": 14.0, "sex": 1.0},
+            {"file_id": "f", "site_id": "SITE_B", "age_at_scan": 15.0, "sex": 2.0},
+        ])
+        config = self.make_fast_config(
+            "artifacts/test",
+            harmonization_method="combat",
+            harmonization_covariates=("age", "sex"),
+        )
+
+        harmonized_train, [harmonized_test], summary = harmonize_feature_sets(
+            train_features,
+            train_metadata,
+            config,
+            (test_features, test_metadata),
+        )
+
+        self.assertTrue(summary["enabled"])
+        self.assertEqual(summary["method"], "combat")
+        self.assertEqual(summary["covariates"], ["age", "sex"])
+        self.assertEqual(harmonized_train.shape, train_features.shape)
+        self.assertEqual(harmonized_test.shape, test_features.shape)
+        self.assertLess(
+            abs(harmonized_train[:2, 0].mean() - harmonized_train[2:, 0].mean()),
+            abs(train_features[:2, 0].mean() - train_features[2:, 0].mean()),
+        )
+
+    def test_linear_svm_baseline_runs_with_combat_harmonization(self):
+        feature_vectors, labels, feature_indices = make_synthetic_feature_matrix()
+        subject_metadata = make_synthetic_subject_metadata(num_samples=len(labels))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.make_fast_config(
+                temp_dir,
+                explanation_methods=(),
+                model_type="linear_svm",
+                harmonization_method="combat",
+                harmonization_covariates=("age", "sex"),
+            )
+            summary = train_and_eval_model(
+                feature_vectors,
+                labels,
+                pipeline='synthetic',
+                feature_indices=feature_indices,
+                subject_metadata=subject_metadata,
+                verbose=False,
+                config=config,
+            )
+
+        self.assertEqual(len(summary.fold_results), 5)
+        self.assertTrue(summary.fold_results[0].confound_summary["harmonization"]["enabled"])
 
     def test_anova_selector_runs_in_leak_free_pipeline(self):
         feature_vectors, labels, feature_indices = make_synthetic_feature_matrix()
