@@ -1,6 +1,7 @@
 import argparse
 import json
 import random
+import re
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -67,6 +68,8 @@ DEFAULT_HARMONIZATION_COVARIATES = (
   "sex",
 )
 DEFAULT_FEATURE_REPRESENTATION = "edge_vector"
+DEFAULT_PREPROCESSING_CONDITION = "filt_global"
+DEFAULT_ROI_ATLAS = "rois_aal"
 
 
 def parse_optional_float(value):
@@ -89,15 +92,72 @@ def load_phenotype_table(pheno_file='data/Phenotypic_V1_0b_preprocessed1.csv'):
   phenotype = phenotype.loc[phenotype['FILE_ID'] != ''].drop_duplicates(subset='FILE_ID', keep='first')
   return phenotype.set_index('FILE_ID', drop=False)
 
-def get_data_from_abide(pipeline, return_subject_metadata=False):
-  downloads = f'abide/downloads/Outputs/{pipeline}/filt_global/rois_aal/'
-  pheno_file = 'data/Phenotypic_V1_0b_preprocessed1.csv'
+def normalize_output_segment(value, default, field_name):
+  normalized_value = str(value or default).strip()
+  if not normalized_value:
+    normalized_value = default
 
-  if not os.path.isdir(downloads):
-    raise FileNotFoundError(
-      f"Could not find raw ROI time-series for pipeline '{pipeline}' at '{downloads}'. "
-      "The corrected reanalysis requires the original subject-level ROI files rather than the legacy globally selected feature CSVs."
+  if not re.fullmatch(r"[A-Za-z0-9_-]+", normalized_value):
+    raise ValueError(
+      f"Invalid {field_name} '{value}'. "
+      f"Use a simple directory name such as '{default}'."
     )
+
+  return normalized_value
+
+
+def resolve_abide_download_dir(
+  pipeline,
+  preprocessing_condition=DEFAULT_PREPROCESSING_CONDITION,
+  roi_atlas=DEFAULT_ROI_ATLAS,
+  downloads_root='abide/downloads/Outputs',
+):
+  pipeline_name = normalize_output_segment(pipeline, pipeline, 'pipeline')
+  preprocessing_condition = normalize_output_segment(
+    preprocessing_condition,
+    DEFAULT_PREPROCESSING_CONDITION,
+    'preprocessing_condition',
+  )
+  roi_atlas = normalize_output_segment(roi_atlas, DEFAULT_ROI_ATLAS, 'roi_atlas')
+
+  downloads_root = Path(downloads_root)
+  pipeline_root = downloads_root / pipeline_name
+  preprocessing_root = pipeline_root / preprocessing_condition
+  downloads_dir = preprocessing_root / roi_atlas
+
+  if downloads_dir.is_dir():
+    return downloads_dir
+
+  available_conditions = sorted(
+    child.name for child in pipeline_root.iterdir()
+    if child.is_dir()
+  ) if pipeline_root.is_dir() else []
+  available_roi_atlases = sorted(
+    child.name for child in preprocessing_root.iterdir()
+    if child.is_dir()
+  ) if preprocessing_root.is_dir() else []
+
+  raise FileNotFoundError(
+    f"Could not find raw ROI time-series for pipeline '{pipeline_name}' at '{downloads_dir}'. "
+    f"Requested preprocessing_condition='{preprocessing_condition}' and roi_atlas='{roi_atlas}'. "
+    "The corrected reanalysis requires the original subject-level ROI files rather than the legacy globally selected feature CSVs. "
+    f"Available preprocessing conditions: {available_conditions or 'none found'}. "
+    f"Available ROI directories under '{preprocessing_root}': {available_roi_atlases or 'none found'}."
+  )
+
+
+def get_data_from_abide(
+  pipeline,
+  preprocessing_condition=DEFAULT_PREPROCESSING_CONDITION,
+  roi_atlas=DEFAULT_ROI_ATLAS,
+  return_subject_metadata=False,
+):
+  downloads = resolve_abide_download_dir(
+    pipeline,
+    preprocessing_condition=preprocessing_condition,
+    roi_atlas=roi_atlas,
+  )
+  pheno_file = 'data/Phenotypic_V1_0b_preprocessed1.csv'
 
   phenotype = load_phenotype_table(pheno_file)
 
@@ -107,7 +167,7 @@ def get_data_from_abide(pipeline, return_subject_metadata=False):
 
   for filename in sorted(os.listdir(downloads)):
     if filename.endswith('.1D'):  # Check if the file is a .1D file
-      filepath = os.path.join(downloads, filename)
+      filepath = downloads / filename
       dataset = np.loadtxt(filepath)  # Load the file
       data.append(dataset)  # Append the dataset to the list
 
@@ -321,6 +381,8 @@ class ReanalysisConfig:
   n_splits: int = 5
   num_selected_features: int = 1000
   feature_representation: str = DEFAULT_FEATURE_REPRESENTATION
+  preprocessing_condition: str = DEFAULT_PREPROCESSING_CONDITION
+  roi_atlas: str = DEFAULT_ROI_ATLAS
   feature_count_candidates: tuple[int, ...] = ()
   feature_count_selection_metric: str = "f1"
   selector_type: str = "rfe"
@@ -1145,6 +1207,8 @@ def build_summary_row(summary, config_name=None, repeat_index=None):
     'config_name': config_name or summary.pipeline,
     'repeat_index': repeat_index,
     'pipeline': summary.pipeline,
+    'preprocessing_condition': config.preprocessing_condition,
+    'roi_atlas': config.roi_atlas,
     'feature_representation': config.feature_representation,
     'model_type': config.model_type,
     'selector_type': config.selector_type,
@@ -1768,9 +1832,73 @@ def expand_relative_coords(coordinates, percent):
   return spread_coordinates
 
 
-def print_connections(rois, weights, method, pipeline, top_regions=50, top_regions_df=10, show_now=False, save=False, print_graph=True):
-  atlas = datasets.fetch_atlas_aal(version='SPM12')
-  labels = atlas.labels  # List of AAL region labels
+def build_generic_roi_labels(roi_count, roi_atlas):
+  atlas_key = normalize_output_segment(roi_atlas, DEFAULT_ROI_ATLAS, 'roi_atlas')
+  return np.array([f"{atlas_key}_{index:03d}" for index in range(int(roi_count))], dtype=object)
+
+
+def load_roi_display_metadata(roi_atlas=DEFAULT_ROI_ATLAS, minimum_roi_count=None, require_coordinates=False):
+  atlas_key = normalize_output_segment(roi_atlas, DEFAULT_ROI_ATLAS, 'roi_atlas')
+
+  if atlas_key == 'rois_aal':
+    atlas = datasets.fetch_atlas_aal(version='SPM12')
+    labels = np.asarray(atlas.labels, dtype=object)
+    coordinates = None
+    if require_coordinates:
+      coordinates = expand_relative_coords(plotting.find_parcellation_cut_coords(atlas.maps), 1.08)
+
+    roi_functions = {}
+    roi_functions_path = Path('aal_roi_functions.json')
+    if roi_functions_path.exists():
+      with open(roi_functions_path, 'r', encoding='utf-8') as file:
+        roi_functions = json.load(file)
+
+    return {
+      'atlas_key': atlas_key,
+      'atlas': atlas,
+      'labels': labels,
+      'coordinates': coordinates,
+      'roi_functions': roi_functions,
+      'supports_connectome': True,
+    }
+
+  roi_count = int(minimum_roi_count or 0)
+  labels = build_generic_roi_labels(roi_count, atlas_key)
+  return {
+    'atlas_key': atlas_key,
+    'atlas': None,
+    'labels': labels,
+    'coordinates': None,
+    'roi_functions': {label: 'Atlas-specific label unavailable' for label in labels},
+    'supports_connectome': False,
+  }
+
+
+def print_connections(
+  rois,
+  weights,
+  method,
+  pipeline,
+  top_regions=50,
+  top_regions_df=10,
+  show_now=False,
+  save=False,
+  print_graph=True,
+  roi_atlas=DEFAULT_ROI_ATLAS,
+):
+  rois = np.asarray(rois, dtype=int)
+  max_roi_index = int(np.max(rois)) + 1 if rois.size else 0
+  display_metadata = load_roi_display_metadata(
+    roi_atlas=roi_atlas,
+    minimum_roi_count=max_roi_index,
+    require_coordinates=print_graph,
+  )
+  atlas = display_metadata['atlas']
+  labels = display_metadata['labels']
+  roi_functions = display_metadata['roi_functions']
+  if print_graph and not display_metadata['supports_connectome']:
+    print_graph = False
+
   weights = np.array(weights)
   rois = rois.astype(int)[:top_regions]
 
@@ -1813,14 +1941,11 @@ def print_connections(rois, weights, method, pipeline, top_regions=50, top_regio
 
   node_color = 'grey'
 
-  coordinates = expand_relative_coords(plotting.find_parcellation_cut_coords(atlas.maps), 1.08) 
-
-  adjacency_matrix = nx.adjacency_matrix(G).todense()
-
-  # Dynamic Thresholding
-  edge_threshold = get_threshold_from_percentile(adjacency_matrix, 0)  # Show all 
-
   if print_graph:
+    coordinates = display_metadata['coordinates']
+    adjacency_matrix = nx.adjacency_matrix(G).todense()
+    edge_threshold = get_threshold_from_percentile(adjacency_matrix, 0)  # Show all
+
     plotting.plot_connectome(adjacency_matrix, coordinates,
                             node_color=node_color,
                             edge_vmin=0,
@@ -1842,7 +1967,7 @@ def print_connections(rois, weights, method, pipeline, top_regions=50, top_regio
   roi_counts = collections.Counter(all_rois)  # Count occurrences of each ROI 
   top_rois, top_counts = zip(*roi_counts.most_common())
 
-  adjacency_matrix = np.zeros((len(coordinates), len(coordinates)))  # No edges
+  adjacency_matrix = np.zeros((len(labels), len(labels)))  # No edges
 
   roi_importances = []
 
@@ -1875,6 +2000,7 @@ def print_connections(rois, weights, method, pipeline, top_regions=50, top_regio
   normalized_colors = cmap((roi_importances - roi_importances.min()) / (roi_importances.max() - roi_importances.min()))
 
   if print_graph:
+    coordinates = display_metadata['coordinates']
     plotting.plot_connectome(adjacency_matrix, coordinates,
                           node_color=normalized_colors,
                           node_size=normalized_sizes,
@@ -1896,24 +2022,34 @@ def print_connections(rois, weights, method, pipeline, top_regions=50, top_regio
     if show_now:
       plt.show()
 
-  # Open the JSON file for reading
-  with open('aal_roi_functions.json', 'r') as file:
-    # Parse the JSON file into a Python dictionary
-    ROI_functions = json.load(file)
-
-  labels = np.array(atlas.labels)
   top_connections = labels[rois[:top_regions_df]]
-  connections_with_weights = np.array([(connection[0], ROI_functions[connection[0]], connection[1], ROI_functions[connection[1]], np.round(weight, 2)) for connection, weight in zip(top_connections, weights)])
+  connections_with_weights = np.array([
+    (
+      connection[0],
+      roi_functions.get(connection[0], 'Atlas-specific label unavailable'),
+      connection[1],
+      roi_functions.get(connection[1], 'Atlas-specific label unavailable'),
+      np.round(weight, 2),
+    )
+    for connection, weight in zip(top_connections, weights)
+  ])
 
   # Convert the top connections to a DataFrame for nice formatting
   top_connections_df = pd.DataFrame(connections_with_weights, columns=['ROI 1', 'ROI 1 function', 'ROI 2', 'ROI 2 function', 'Importance'])
 
   important_rois = np.argsort(roi_importances)[::-1]
   important_rois_weights = roi_importances[important_rois]
-  
+
   important_rois_weights = 10 * ((important_rois_weights - important_rois_weights.min()) / (important_rois_weights.max() - important_rois_weights.min()))
 
-  important_rois_with_weights = np.array([(labels[roi], ROI_functions[labels[roi]], np.round(weight, 2)) for roi, weight in zip(important_rois, important_rois_weights)])
+  important_rois_with_weights = np.array([
+    (
+      labels[roi],
+      roi_functions.get(labels[roi], 'Atlas-specific label unavailable'),
+      np.round(weight, 2),
+    )
+    for roi, weight in zip(important_rois, important_rois_weights)
+  ])
 
   top_rois_df = pd.DataFrame(important_rois_with_weights[:top_regions_df], columns=['ROI', 'Function', 'Importance'])
 
@@ -2879,6 +3015,8 @@ def parse_reanalysis_log(log_path):
     raise FileNotFoundError(log_path)
 
   config_keys = {
+    'preprocessing_condition',
+    'roi_atlas',
     'feature_representation',
     'model_type',
     'selector_type',
@@ -2952,7 +3090,12 @@ def collect_reanalysis_logs(logs_dir, pattern='*.log'):
 def run_pipeline_reanalysis(pipeline, verbose=False, config=None):
   if config is None:
     config = ReanalysisConfig()
-  data, labels, subject_metadata = get_data_from_abide(pipeline, return_subject_metadata=True)
+  data, labels, subject_metadata = get_data_from_abide(
+    pipeline,
+    preprocessing_condition=config.preprocessing_condition,
+    roi_atlas=config.roi_atlas,
+    return_subject_metadata=True,
+  )
   feature_vectors, feature_indices = get_feature_vecs(
     data,
     feature_representation=config.feature_representation,
@@ -3086,8 +3229,9 @@ def get_relaxed_overlap(rois_1, rois_2, centroid_distance_threshold=0.5):
   # # Find the original ROIs corresponding to the overlapping base names
   # overlap = {roi for roi in rois_1 if get_base_name(roi) in relaxed_overlap} | {roi for roi in rois_2 if get_base_name(roi) in relaxed_overlap}
 
-  atlas = datasets.fetch_atlas_aal(version='SPM12')
-  labels = atlas.labels  # List of AAL region labels
+  atlas_metadata = load_roi_display_metadata(roi_atlas=DEFAULT_ROI_ATLAS, require_coordinates=True)
+  atlas = atlas_metadata['atlas']
+  labels = atlas_metadata['labels']
   label_indices = {label: index for index, label in enumerate(labels)}
 
   # Get the indices of the selected ROIs
@@ -3095,7 +3239,7 @@ def get_relaxed_overlap(rois_1, rois_2, centroid_distance_threshold=0.5):
   selected_labels = [labels[index] for index in selected_indices]
 
   # Get the coordinates of the ROIs
-  coordinates = expand_relative_coords(plotting.find_parcellation_cut_coords(atlas.maps), 1.08) 
+  coordinates = atlas_metadata['coordinates']
   filtered_coordinates = [coordinates[index] for index in selected_indices]
 
   overlap = []
@@ -3147,10 +3291,15 @@ def get_top_rois(pipeline_or_summary, labels_from_abide=None, RFE_step=20, N_roi
   return pd.read_csv(artifact_path).head(N_rois)
 
 
-def print_rois(rois):
-  # Fetch the AAL atlas
-  atlas = datasets.fetch_atlas_aal(version='SPM12')
-  labels = atlas.labels  # List of AAL region labels
+def print_rois(rois, roi_atlas=DEFAULT_ROI_ATLAS):
+  atlas_metadata = load_roi_display_metadata(roi_atlas=roi_atlas, require_coordinates=True)
+  if not atlas_metadata['supports_connectome']:
+    raise ValueError(
+      f"ROI plotting is only implemented for '{DEFAULT_ROI_ATLAS}'. "
+      f"Current roi_atlas is '{roi_atlas}'. Use the saved CSV artifacts for non-AAL atlas runs."
+    )
+
+  labels = atlas_metadata['labels']
   label_indices = {label: index for index, label in enumerate(labels)}
 
   # Get the indices of the selected ROIs
@@ -3158,7 +3307,7 @@ def print_rois(rois):
   selected_labels = [labels[index] for index in selected_indices]
 
   # Get the coordinates of the ROIs
-  coordinates = expand_relative_coords(plotting.find_parcellation_cut_coords(atlas.maps), 1.08) 
+  coordinates = atlas_metadata['coordinates']
   filtered_coordinates = [coordinates[index] for index in selected_indices]
 
   # Create an empty adjacency matrix for all ROIs
@@ -3192,10 +3341,16 @@ def print_rois(rois):
 
   plt.show()
 
-def view_rois(rois):
-  # Fetch the AAL atlas
-  atlas = datasets.fetch_atlas_aal(version='SPM12')
-  labels = atlas.labels  # List of AAL region labels
+def view_rois(rois, roi_atlas=DEFAULT_ROI_ATLAS):
+  atlas_metadata = load_roi_display_metadata(roi_atlas=roi_atlas, require_coordinates=True)
+  if not atlas_metadata['supports_connectome']:
+    raise ValueError(
+      f"ROI plotting is only implemented for '{DEFAULT_ROI_ATLAS}'. "
+      f"Current roi_atlas is '{roi_atlas}'. Use the saved CSV artifacts for non-AAL atlas runs."
+    )
+
+  atlas = atlas_metadata['atlas']
+  labels = atlas_metadata['labels']
   label_indices = {label: index for index, label in enumerate(labels)}
 
   # Filter to include only the requested ROIs
@@ -3238,6 +3393,8 @@ if __name__ == "__main__":
   parser.add_argument('--analyze_methods', type=lambda x: (str(x).lower() == 'true'), default=False, help='Legacy flag retained for CLI compatibility. ROAR is disabled in correction mode.')
   parser.add_argument('--pipelines', nargs='*', default=['ccs', 'cpac', 'dparsf', 'niak'], help='Pipelines to reanalyse using fold-specific feature selection.')
   parser.add_argument('--artifact_root', default='artifacts/reanalysis', help='Directory for corrected reanalysis artifacts.')
+  parser.add_argument('--preprocessing_condition', default=DEFAULT_PREPROCESSING_CONDITION, help='ABIDE preprocessing condition directory to load, e.g. filt_global, filt_noglobal, nofilt_global, nofilt_noglobal')
+  parser.add_argument('--roi_atlas', default=DEFAULT_ROI_ATLAS, help='ROI atlas directory to load, e.g. rois_aal, rois_cc200, rois_cc400, rois_ho, rois_dosenbach160, rois_ez, rois_tt')
   parser.add_argument('--num_selected_features', type=int, default=1000, help='Number of fold-local SVM-RFE features to keep.')
   parser.add_argument('--feature_representation', default=DEFAULT_FEATURE_REPRESENTATION, help='Connectivity representation to build before fold-local selection. Options: edge_vector, graph_summary')
   parser.add_argument('--selector_type', default='rfe', help='Feature selector to use inside each fold. Options: rfe, anova_f, mutual_info, logistic_l1')
@@ -3310,6 +3467,8 @@ if __name__ == "__main__":
   print("run_hyperparameter_sweep: ", run_hyperparameter_sweep_flag)
   print("run_repeated_evaluation: ", run_repeated_evaluation_flag)
   print("collect_results_from_logs: ", collect_results_from_logs_flag)
+  print("preprocessing_condition: ", args.preprocessing_condition)
+  print("roi_atlas: ", args.roi_atlas)
   print("feature_representation: ", args.feature_representation)
   print("model_type: ", args.model_type)
   print("selector_type: ", args.selector_type)
@@ -3346,6 +3505,8 @@ if __name__ == "__main__":
   base_config = ReanalysisConfig(
     random_seed=DEFAULT_SEED,
     artifact_root=args.artifact_root,
+    preprocessing_condition=args.preprocessing_condition,
+    roi_atlas=args.roi_atlas,
     num_selected_features=args.num_selected_features,
     feature_representation=args.feature_representation,
     selector_type=args.selector_type,
@@ -3469,8 +3630,16 @@ if __name__ == "__main__":
 
   if args.run_permutation_test:
     print("\nRunning corrected CCS permutation test")
-    ccs_data, ccs_labels, ccs_subject_metadata = get_data_from_abide('ccs', return_subject_metadata=True)
-    ccs_feature_vectors, ccs_feature_indices = get_feature_vecs(ccs_data)
+    ccs_data, ccs_labels, ccs_subject_metadata = get_data_from_abide(
+      'ccs',
+      preprocessing_condition=base_config.preprocessing_condition,
+      roi_atlas=base_config.roi_atlas,
+      return_subject_metadata=True,
+    )
+    ccs_feature_vectors, ccs_feature_indices = get_feature_vecs(
+      ccs_data,
+      feature_representation=base_config.feature_representation,
+    )
     permutation_config = ReanalysisConfig(**asdict(base_config))
     permutation_config.explanation_methods = ()
     observed_summary, permutation_results = run_permutation_test(

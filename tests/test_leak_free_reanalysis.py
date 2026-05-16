@@ -28,6 +28,7 @@ from app.main import (
     harmonize_feature_sets,
     load_legacy_selected_features,
     parse_reanalysis_log,
+    resolve_abide_download_dir,
     regress_out_confounds,
     run_repeated_evaluation,
     train_supervised_stage,
@@ -143,6 +144,21 @@ class LeakFreeReanalysisTests(unittest.TestCase):
 
         self.assertIn('Integrated Gradients', explanations)
         self.assertIn('edge_vector features', explanations['Integrated Gradients'].skipped_reason)
+
+    def test_resolve_abide_download_dir_supports_custom_condition_and_atlas(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            downloads_root = Path(temp_dir) / "Outputs"
+            target_dir = downloads_root / "dparsf" / "filt_noglobal" / "rois_cc200"
+            target_dir.mkdir(parents=True)
+
+            resolved_dir = resolve_abide_download_dir(
+                "dparsf",
+                preprocessing_condition="filt_noglobal",
+                roi_atlas="rois_cc200",
+                downloads_root=downloads_root,
+            )
+
+        self.assertEqual(resolved_dir, target_dir)
 
     def test_corrected_training_uses_outer_train_only_for_feature_selection(self):
         feature_vectors, labels, feature_indices = make_synthetic_feature_matrix()
@@ -538,6 +554,8 @@ class LeakFreeReanalysisTests(unittest.TestCase):
             log_path = Path(temp_dir) / "dparsf_ssae.log"
             log_path.write_text(
                 "\n".join([
+                    "preprocessing_condition:  filt_noglobal",
+                    "roi_atlas:  rois_cc200",
                     "feature_representation:  edge_vector",
                     "model_type:  ssae",
                     "selector_type:  rfe",
@@ -555,6 +573,8 @@ class LeakFreeReanalysisTests(unittest.TestCase):
             record = parse_reanalysis_log(log_path)
 
         self.assertEqual(record["pipeline"], "dparsf")
+        self.assertEqual(record["preprocessing_condition"], "filt_noglobal")
+        self.assertEqual(record["roi_atlas"], "rois_cc200")
         self.assertEqual(record["model_type"], "ssae")
         self.assertEqual(record["harmonization_method"], "combat")
         self.assertAlmostEqual(record["accuracy_mean"], 0.6470)
