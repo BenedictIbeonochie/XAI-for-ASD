@@ -24,6 +24,7 @@ from app.main import (
     coerce_explanation_ranking,
     compute_fold_explanations,
     get_feature_vecs,
+    get_top_features_from_selector,
     get_top_features_from_SVM_RFE,
     harmonize_feature_sets,
     load_legacy_selected_features,
@@ -103,6 +104,22 @@ class LeakFreeReanalysisTests(unittest.TestCase):
         self.assertEqual(selection.selected_feature_indices.shape, (5,))
         self.assertEqual(selection.selected_roi_pairs.shape, (5, 2))
         np.testing.assert_array_equal(selection.training_sample_indices, train_indices)
+
+    def test_none_selector_returns_all_features_without_filtering(self):
+        feature_vectors, labels, feature_indices = make_synthetic_feature_matrix(num_features=7)
+
+        selection = get_top_features_from_selector(
+            feature_vectors,
+            labels,
+            feature_indices,
+            N=3,
+            step=1,
+            selector_type='none',
+            training_sample_indices=np.arange(len(feature_vectors)),
+        )
+
+        np.testing.assert_array_equal(selection.selected_feature_indices, np.arange(7))
+        np.testing.assert_array_equal(selection.selected_roi_pairs, feature_indices)
 
     def test_graph_summary_representation_returns_roi_level_features(self):
         data = [
@@ -205,6 +222,30 @@ class LeakFreeReanalysisTests(unittest.TestCase):
 
         outputs = model(torch.tensor([[1.0, 2.0]], dtype=torch.float32))
         np.testing.assert_allclose(outputs.detach().numpy(), np.array([[0.25, -0.5]], dtype=np.float32))
+
+    def test_stacked_autoencoder_dropout_only_applies_during_training(self):
+        ae1 = Autoencoder(2, 2)
+        ae2 = Autoencoder(2, 2)
+        classifier = SoftmaxClassifier(2, 2)
+        model = StackedAutoencoder(ae1, ae2, classifier, dropout_rate=1.0)
+
+        with torch.no_grad():
+            ae1.encoder.weight.copy_(torch.eye(2, dtype=torch.float32))
+            ae1.encoder.bias.zero_()
+            ae2.encoder.weight.copy_(torch.eye(2, dtype=torch.float32))
+            ae2.encoder.bias.zero_()
+            classifier.linear.weight.copy_(torch.tensor([[1.0, 1.0], [-1.0, -1.0]], dtype=torch.float32))
+            classifier.linear.bias.copy_(torch.tensor([0.5, -0.25], dtype=torch.float32))
+
+        training_input = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
+
+        model.train()
+        train_outputs = model(training_input)
+        np.testing.assert_allclose(train_outputs.detach().numpy(), np.array([[0.5, -0.25]], dtype=np.float32))
+
+        model.eval()
+        eval_outputs = model(training_input)
+        np.testing.assert_allclose(eval_outputs.detach().numpy(), np.array([[3.5, -3.25]], dtype=np.float32))
 
     def test_train_supervised_stage_stops_after_validation_plateau(self):
         train_features = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=float)
@@ -559,6 +600,7 @@ class LeakFreeReanalysisTests(unittest.TestCase):
                     "feature_representation:  edge_vector",
                     "model_type:  ssae",
                     "selector_type:  rfe",
+                    "ssae_dropout_rate:  0.3",
                     "harmonization_method:  combat",
                     "enable_confound_regression:  False",
                     "Accuracy: 64.70%",
@@ -576,6 +618,7 @@ class LeakFreeReanalysisTests(unittest.TestCase):
         self.assertEqual(record["preprocessing_condition"], "filt_noglobal")
         self.assertEqual(record["roi_atlas"], "rois_cc200")
         self.assertEqual(record["model_type"], "ssae")
+        self.assertEqual(record["ssae_dropout_rate"], "0.3")
         self.assertEqual(record["harmonization_method"], "combat")
         self.assertAlmostEqual(record["accuracy_mean"], 0.6470)
         self.assertAlmostEqual(record["f1_mean"], 0.6008)

@@ -298,36 +298,39 @@ def get_top_features_from_selector(
 ):
   roi_lookup = prepare_feature_index_lookup(indices)
   selector_key = str(selector_type).strip().lower()
-  N = min(int(N), X.shape[1])
-
-  if selector_key == 'rfe':
-    estimator = SVC(kernel="linear")
-    selector = RFE(estimator=estimator, n_features_to_select=N, step=step, verbose=0)
-    selector.fit(X, Y)
-    top_indices = np.where(selector.support_)[0]
+  if selector_key in {'none', 'all'}:
+    top_indices = np.arange(X.shape[1], dtype=int)
   else:
-    if selector_key == 'anova_f':
-      scores, _ = f_classif(X, Y)
-    elif selector_key == 'mutual_info':
-      scores = mutual_info_classif(X, Y, random_state=random_seed)
-    elif selector_key == 'logistic_l1':
-      selector_model = LogisticRegression(
-        penalty='l1',
-        solver='saga',
-        C=logistic_c,
-        max_iter=5000,
-        random_state=random_seed,
-      )
-      selector_model.fit(X, Y)
-      scores = np.max(np.abs(selector_model.coef_), axis=0)
-    else:
-      raise ValueError(
-        f"Unknown selector_type '{selector_type}'. "
-        "Supported options: rfe, anova_f, mutual_info, logistic_l1."
-      )
+    N = min(int(N), X.shape[1])
 
-    scores = np.nan_to_num(np.asarray(scores, dtype=float), nan=-np.inf, posinf=np.finfo(float).max, neginf=-np.inf)
-    top_indices = np.argsort(scores)[-N:]
+    if selector_key == 'rfe':
+      estimator = SVC(kernel="linear")
+      selector = RFE(estimator=estimator, n_features_to_select=N, step=step, verbose=0)
+      selector.fit(X, Y)
+      top_indices = np.where(selector.support_)[0]
+    else:
+      if selector_key == 'anova_f':
+        scores, _ = f_classif(X, Y)
+      elif selector_key == 'mutual_info':
+        scores = mutual_info_classif(X, Y, random_state=random_seed)
+      elif selector_key == 'logistic_l1':
+        selector_model = LogisticRegression(
+          penalty='l1',
+          solver='saga',
+          C=logistic_c,
+          max_iter=5000,
+          random_state=random_seed,
+        )
+        selector_model.fit(X, Y)
+        scores = np.max(np.abs(selector_model.coef_), axis=0)
+      else:
+        raise ValueError(
+          f"Unknown selector_type '{selector_type}'. "
+          "Supported options: rfe, anova_f, mutual_info, logistic_l1, none."
+        )
+
+      scores = np.nan_to_num(np.asarray(scores, dtype=float), nan=-np.inf, posinf=np.finfo(float).max, neginf=-np.inf)
+      top_indices = np.argsort(scores)[-N:]
 
   top_indices = np.sort(np.asarray(top_indices, dtype=int))
   top_rois = roi_lookup[top_indices].astype(int)
@@ -417,6 +420,7 @@ class ReanalysisConfig:
   random_seed: int = DEFAULT_SEED
   ae1_hidden_size: int | None = 500
   ae2_hidden_size: int | None = 100
+  ssae_dropout_rate: float = 0.0
   use_feature_scaling: bool = True
   explanation_methods: tuple[str, ...] = DEFAULT_INTERPRETATION_METHODS
   explanation_top_n: int = 50
@@ -1061,6 +1065,9 @@ def harmonize_feature_sets(train_features, train_metadata, config, *other_featur
 
 
 def get_candidate_feature_counts(config, max_feature_count):
+  if normalize_selector_type(config.selector_type) in {'none', 'all'}:
+    return (int(max_feature_count),)
+
   raw_candidates = config.feature_count_candidates if config.feature_count_candidates else (config.num_selected_features,)
   normalized_candidates = []
 
@@ -1212,6 +1219,7 @@ def build_summary_row(summary, config_name=None, repeat_index=None):
     'feature_representation': config.feature_representation,
     'model_type': config.model_type,
     'selector_type': config.selector_type,
+    'ssae_dropout_rate': float(config.ssae_dropout_rate),
     'harmonization_method': config.harmonization_method,
     'enable_confound_regression': bool(config.enable_confound_regression),
     'num_selected_features': int(config.num_selected_features),
@@ -1480,15 +1488,18 @@ class SoftmaxClassifier(nn.Module):
     return out
   
 class StackedAutoencoder(nn.Module):
-  def __init__(self, AE1, AE2, classifier):
+  def __init__(self, AE1, AE2, classifier, dropout_rate=0.0):
       super(StackedAutoencoder, self).__init__()
       self.ae1 = AE1  # Assuming you have your pre-trained AE1
       self.ae2 = AE2  # Assuming you have your pre-trained AE2
-      self.classifier = classifier 
+      self.classifier = classifier
+      self.dropout = nn.Dropout(p=float(max(0.0, dropout_rate)))
 
   def forward(self, x):
       x = torch.relu(self.ae1.encoder(x))  # Match the non-linearity used during autoencoder pretraining
+      x = self.dropout(x)
       x = torch.relu(self.ae2.encoder(x))  # Preserve the learned staged representation
+      x = self.dropout(x)
       x = self.classifier(x)
       return x
   
@@ -2071,7 +2082,12 @@ def train_single_fold_model(train_dataloader, val_dataloader, input_size, config
   ae1 = Autoencoder(input_size, ae1_hidden_size).to(device)
   ae2 = Autoencoder(ae1_hidden_size, ae2_hidden_size).to(device)
   classifier = SoftmaxClassifier(ae2_hidden_size, 2).to(device)
-  model = StackedAutoencoder(ae1, ae2, classifier).to(device)
+  model = StackedAutoencoder(
+    ae1,
+    ae2,
+    classifier,
+    dropout_rate=config.ssae_dropout_rate,
+  ).to(device)
 
   optimizer_ae1 = optim.Adam(ae1.parameters(), lr=config.ae_learning_rate, weight_decay=config.weight_decay)
   optimizer_ae2 = optim.Adam(ae2.parameters(), lr=config.ae_learning_rate, weight_decay=config.weight_decay)
@@ -3020,6 +3036,7 @@ def parse_reanalysis_log(log_path):
     'feature_representation',
     'model_type',
     'selector_type',
+    'ssae_dropout_rate',
     'harmonization_method',
     'enable_confound_regression',
     'interpretation_methods',
@@ -3395,12 +3412,13 @@ if __name__ == "__main__":
   parser.add_argument('--artifact_root', default='artifacts/reanalysis', help='Directory for corrected reanalysis artifacts.')
   parser.add_argument('--preprocessing_condition', default=DEFAULT_PREPROCESSING_CONDITION, help='ABIDE preprocessing condition directory to load, e.g. filt_global, filt_noglobal, nofilt_global, nofilt_noglobal')
   parser.add_argument('--roi_atlas', default=DEFAULT_ROI_ATLAS, help='ROI atlas directory to load, e.g. rois_aal, rois_cc200, rois_cc400, rois_ho, rois_dosenbach160, rois_ez, rois_tt')
-  parser.add_argument('--num_selected_features', type=int, default=1000, help='Number of fold-local SVM-RFE features to keep.')
+  parser.add_argument('--num_selected_features', type=int, default=1000, help='Number of fold-local features to keep when an explicit selector is used. Ignored when --selector_type none.')
   parser.add_argument('--feature_representation', default=DEFAULT_FEATURE_REPRESENTATION, help='Connectivity representation to build before fold-local selection. Options: edge_vector, graph_summary')
-  parser.add_argument('--selector_type', default='rfe', help='Feature selector to use inside each fold. Options: rfe, anova_f, mutual_info, logistic_l1')
+  parser.add_argument('--selector_type', default='rfe', help='Feature selector to use inside each fold. Options: rfe, anova_f, mutual_info, logistic_l1, none')
   parser.add_argument('--model_type', default='ssae', help='Model to train on the selected features. Options: ssae, linear_svm, logistic_l1, logistic_elastic_net, hist_gradient_boosting')
   parser.add_argument('--ae1_hidden_size', type=int, default=500, help='Hidden size for the first autoencoder layer.')
   parser.add_argument('--ae2_hidden_size', type=int, default=100, help='Hidden size for the second autoencoder layer.')
+  parser.add_argument('--ssae_dropout_rate', type=float, default=0.0, help='Dropout rate applied between SSAE encoder layers during supervised classification and fine-tuning.')
   parser.add_argument('--feature_count_candidates', nargs='*', type=int, default=None, help='Optional feature-count candidates to tune inside each training fold, e.g. --feature_count_candidates 250 500 750 1000')
   parser.add_argument('--feature_count_selection_metric', default='f1', help='Validation metric used to choose feature count. Options: accuracy, sensitivity, specificity, precision, f1')
   parser.add_argument('--rfe_step', type=int, default=20, help='SVM-RFE elimination step size.')
@@ -3472,6 +3490,7 @@ if __name__ == "__main__":
   print("feature_representation: ", args.feature_representation)
   print("model_type: ", args.model_type)
   print("selector_type: ", args.selector_type)
+  print("ssae_dropout_rate: ", args.ssae_dropout_rate)
   print("harmonization_method: ", args.harmonization_method)
   print("enable_confound_regression: ", args.enable_confound_regression)
   print("Torch Cuda is Available =", use_cuda)
@@ -3517,6 +3536,7 @@ if __name__ == "__main__":
     fine_tuning_epochs=args.fine_tuning_epochs,
     ae1_hidden_size=args.ae1_hidden_size,
     ae2_hidden_size=args.ae2_hidden_size,
+    ssae_dropout_rate=args.ssae_dropout_rate,
     feature_count_candidates=tuple(args.feature_count_candidates or ()),
     feature_count_selection_metric=args.feature_count_selection_metric,
     rfe_step=args.rfe_step,
