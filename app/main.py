@@ -24,11 +24,12 @@ import os
 import pdb
 import seaborn as sns
 from sklearn.svm import SVC
-from sklearn.feature_selection import RFE, f_classif, mutual_info_classif
+from sklearn.feature_selection import RFE, RFECV, f_classif, mutual_info_classif
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.covariance import LedoitWolf
+from sklearn.decomposition import PCA
 from sklearn.svm import LinearSVC
 from sklearn.ensemble import HistGradientBoostingClassifier
 from captum.attr import IntegratedGradients, DeepLiftShap, DeepLift, GradientShap, ShapleyValueSampling, ShapleyValues, FeatureAblation, GuidedBackprop, Occlusion
@@ -381,6 +382,7 @@ def get_top_features_from_selector(
   training_sample_indices=None,
   random_seed=DEFAULT_SEED,
   logistic_c=1.0,
+  rfecv_inner_splits=3,
 ):
   roi_lookup = prepare_feature_index_lookup(indices)
   selector_key = str(selector_type).strip().lower()
@@ -392,6 +394,21 @@ def get_top_features_from_selector(
     if selector_key == 'rfe':
       estimator = SVC(kernel="linear")
       selector = RFE(estimator=estimator, n_features_to_select=N, step=step, verbose=0)
+      selector.fit(X, Y)
+      top_indices = np.where(selector.support_)[0]
+    elif selector_key == 'rfecv':
+      label_counts = np.bincount(np.asarray(Y, dtype=int))
+      valid_label_counts = label_counts[label_counts > 0]
+      max_splits = int(valid_label_counts.min()) if len(valid_label_counts) else 2
+      cv_splits = max(2, min(int(rfecv_inner_splits), max_splits))
+      estimator = LinearSVC(dual='auto', max_iter=5000, random_state=random_seed)
+      selector = RFECV(
+        estimator=estimator,
+        step=step,
+        cv=StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=random_seed),
+        scoring='f1',
+        min_features_to_select=1,
+      )
       selector.fit(X, Y)
       top_indices = np.where(selector.support_)[0]
     else:
@@ -409,14 +426,18 @@ def get_top_features_from_selector(
         )
         selector_model.fit(X, Y)
         scores = np.max(np.abs(selector_model.coef_), axis=0)
+      elif selector_key == 'mrmr':
+        top_indices = fit_greedy_mrmr_indices(X, Y, N, random_seed=random_seed)
+        scores = None
       else:
         raise ValueError(
           f"Unknown selector_type '{selector_type}'. "
-          "Supported options: rfe, anova_f, mutual_info, logistic_l1, none."
+          "Supported options: rfe, rfecv, anova_f, mutual_info, logistic_l1, mrmr, none."
         )
 
-      scores = np.nan_to_num(np.asarray(scores, dtype=float), nan=-np.inf, posinf=np.finfo(float).max, neginf=-np.inf)
-      top_indices = np.argsort(scores)[-N:]
+      if scores is not None:
+        scores = np.nan_to_num(np.asarray(scores, dtype=float), nan=-np.inf, posinf=np.finfo(float).max, neginf=-np.inf)
+        top_indices = np.argsort(scores)[-N:]
 
   top_indices = np.sort(np.asarray(top_indices, dtype=int))
   top_rois = roi_lookup[top_indices].astype(int)
@@ -470,11 +491,14 @@ class ReanalysisConfig:
   n_splits: int = 5
   num_selected_features: int = 1000
   feature_representation: str = DEFAULT_FEATURE_REPRESENTATION
+  feature_transform: str = "none"
+  pca_components: int = 0
   preprocessing_condition: str = DEFAULT_PREPROCESSING_CONDITION
   roi_atlas: str = DEFAULT_ROI_ATLAS
   feature_count_candidates: tuple[int, ...] = ()
   feature_count_selection_metric: str = "f1"
   selector_type: str = "rfe"
+  rfecv_inner_splits: int = 3
   model_type: str = "ssae"
   rfe_step: int = 20
   validation_size: float = 0.2
@@ -550,6 +574,7 @@ class FoldResult:
   test_feature_shape: tuple[int, int]
   scaler_mean: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=float))
   scaler_scale: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=float))
+  feature_transform_summary: dict[str, Any] = field(default_factory=dict)
   feature_count_tuning_records: list[dict[str, Any]] = field(default_factory=list)
   training_summary: dict[str, Any] = field(default_factory=dict)
   confound_summary: dict[str, Any] = field(default_factory=dict)
@@ -673,12 +698,109 @@ def apply_feature_selection(features, selection):
   return sanitize_feature_matrix(features)[:, selection.selected_feature_indices]
 
 
+def fit_greedy_mrmr_indices(X, Y, num_features, random_seed=DEFAULT_SEED):
+  X = sanitize_feature_matrix(X)
+  num_samples, total_features = X.shape
+  num_features = max(1, min(int(num_features), total_features))
+
+  relevance = mutual_info_classif(X, Y, random_state=random_seed)
+  relevance = np.nan_to_num(np.asarray(relevance, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+
+  if num_features >= total_features:
+    return np.arange(total_features, dtype=int)
+
+  pool_size = min(total_features, max(num_features * 3, 2000))
+  candidate_pool = np.argsort(relevance)[-pool_size:]
+  candidate_pool = np.sort(np.asarray(candidate_pool, dtype=int))
+
+  pool_features = X[:, candidate_pool].astype(np.float32, copy=False)
+  centered = pool_features - pool_features.mean(axis=0, keepdims=True)
+  scale = pool_features.std(axis=0, keepdims=True)
+  scale[scale == 0] = 1.0
+  standardized = centered / scale
+
+  pool_relevance = relevance[candidate_pool]
+  selected_pool_indices = []
+  remaining_mask = np.ones(len(candidate_pool), dtype=bool)
+  redundancy_sums = np.zeros(len(candidate_pool), dtype=np.float32)
+  denominator = max(1, num_samples - 1)
+
+  first_index = int(np.argmax(pool_relevance))
+  selected_pool_indices.append(first_index)
+  remaining_mask[first_index] = False
+
+  while len(selected_pool_indices) < num_features and remaining_mask.any():
+    last_selected = selected_pool_indices[-1]
+    new_correlations = np.abs(standardized.T @ standardized[:, last_selected]) / denominator
+    new_correlations[last_selected] = 0.0
+    redundancy_sums += np.nan_to_num(new_correlations, nan=0.0, posinf=0.0, neginf=0.0)
+
+    mrmr_scores = pool_relevance - (redundancy_sums / len(selected_pool_indices))
+    mrmr_scores[~remaining_mask] = -np.inf
+    next_index = int(np.argmax(mrmr_scores))
+    if not np.isfinite(mrmr_scores[next_index]):
+      break
+
+    selected_pool_indices.append(next_index)
+    remaining_mask[next_index] = False
+
+  selected_indices = candidate_pool[np.asarray(selected_pool_indices, dtype=int)]
+  return np.sort(np.asarray(selected_indices, dtype=int))
+
+
+def fit_feature_transform(train_features, config):
+  transform_key = normalize_feature_transform(config.feature_transform)
+  train_features = sanitize_feature_matrix(train_features)
+
+  if transform_key in {'', 'none'}:
+    summary = {
+      'enabled': False,
+      'type': 'none',
+      'n_components': int(train_features.shape[1]),
+      'explained_variance_ratio_sum': None,
+    }
+    return train_features, None, summary
+
+  if transform_key == 'pca':
+    max_components = max(1, min(train_features.shape[0], train_features.shape[1]))
+    requested_components = int(config.pca_components) if config.pca_components is not None else 0
+    n_components = max_components if requested_components <= 0 else min(requested_components, max_components)
+    transformer = PCA(n_components=n_components, svd_solver='auto')
+    transformed_train = sanitize_feature_matrix(transformer.fit_transform(train_features))
+    summary = {
+      'enabled': True,
+      'type': 'pca',
+      'n_components': int(n_components),
+      'explained_variance_ratio_sum': float(np.sum(transformer.explained_variance_ratio_)),
+    }
+    return transformed_train, transformer, summary
+
+  raise ValueError(
+    f"Unknown feature_transform '{config.feature_transform}'. "
+    "Supported options: none, pca."
+  )
+
+
+def apply_feature_transform(transformer, *feature_sets):
+  if transformer is None:
+    return [sanitize_feature_matrix(feature_set) for feature_set in feature_sets]
+
+  return [
+    sanitize_feature_matrix(transformer.transform(sanitize_feature_matrix(feature_set)))
+    for feature_set in feature_sets
+  ]
+
+
 def normalize_model_type(model_type):
   return str(model_type).strip().lower()
 
 
 def normalize_selector_type(selector_type):
   return str(selector_type).strip().lower()
+
+
+def normalize_feature_transform(feature_transform):
+  return str(feature_transform or 'none').strip().lower()
 
 
 def normalize_confound_variables(confound_variables):
@@ -1153,6 +1275,8 @@ def harmonize_feature_sets(train_features, train_metadata, config, *other_featur
 def get_candidate_feature_counts(config, max_feature_count):
   if normalize_selector_type(config.selector_type) in {'none', 'all'}:
     return (int(max_feature_count),)
+  if normalize_selector_type(config.selector_type) == 'rfecv':
+    return (min(int(config.num_selected_features), int(max_feature_count)),)
 
   raw_candidates = config.feature_count_candidates if config.feature_count_candidates else (config.num_selected_features,)
   normalized_candidates = []
@@ -1303,8 +1427,11 @@ def build_summary_row(summary, config_name=None, repeat_index=None):
     'preprocessing_condition': config.preprocessing_condition,
     'roi_atlas': config.roi_atlas,
     'feature_representation': config.feature_representation,
+    'feature_transform': config.feature_transform,
+    'pca_components': int(config.pca_components),
     'model_type': config.model_type,
     'selector_type': config.selector_type,
+    'rfecv_inner_splits': int(config.rfecv_inner_splits),
     'ssae_dropout_rate': float(config.ssae_dropout_rate),
     'harmonization_method': config.harmonization_method,
     'enable_confound_regression': bool(config.enable_confound_regression),
@@ -2448,6 +2575,7 @@ def select_feature_count_for_fold(feature_vectors, labels_from_abide, roi_lookup
       training_sample_indices=train_indices,
       random_seed=config.random_seed,
       logistic_c=config.logistic_c,
+      rfecv_inner_splits=config.rfecv_inner_splits,
     )
 
     candidate_train_features = apply_feature_selection(candidate_train_base_features, candidate_selection)
@@ -2455,6 +2583,14 @@ def select_feature_count_for_fold(feature_vectors, labels_from_abide, roi_lookup
     candidate_train_features, [candidate_validation_features], _ = scale_feature_sets(
       candidate_train_features,
       config,
+      candidate_validation_features,
+    )
+    candidate_train_features, candidate_transformer, candidate_transform_summary = fit_feature_transform(
+      candidate_train_features,
+      config,
+    )
+    [candidate_validation_features] = apply_feature_transform(
+      candidate_transformer,
       candidate_validation_features,
     )
 
@@ -2482,6 +2618,7 @@ def select_feature_count_for_fold(feature_vectors, labels_from_abide, roi_lookup
       'training_summary': candidate_training_summary,
       'harmonization_summary': harmonization_summary,
       'confound_summary': confound_summary,
+      'feature_transform_summary': candidate_transform_summary,
     })
 
     if verbose:
@@ -2516,6 +2653,17 @@ def compute_fold_explanations(model, train_dataloader, test_dataloader, selected
   selected_roi_pairs = np.asarray(selected_roi_pairs, dtype=int)
   method_map = get_interpretability_method_map()
   feature_representation = normalize_feature_representation(config.feature_representation)
+  feature_transform = normalize_feature_transform(config.feature_transform)
+
+  if feature_transform not in {'', 'none'}:
+    for method_name in config.explanation_methods:
+      explanation_rankings[method_name] = ExplanationRanking(
+        skipped_reason=(
+          f"Interpretation method '{method_name}' is not aggregated after feature_transform "
+          f"'{config.feature_transform}' because transformed components no longer map directly to ROI pairs."
+        ),
+      )
+    return explanation_rankings
 
   if not is_edge_level_feature_representation(feature_representation):
     for method_name in config.explanation_methods:
@@ -2674,6 +2822,7 @@ def write_fold_artifacts(fold_result, artifact_dir):
   )
   write_json_file(artifact_dir / 'training_summary.json', fold_result.training_summary)
   write_json_file(artifact_dir / 'confound_regression.json', fold_result.confound_summary)
+  write_json_file(artifact_dir / 'feature_transform.json', fold_result.feature_transform_summary)
 
   for method_name, explanation in fold_result.explanation_rankings.items():
     method_slug = slugify_method_name(method_name)
@@ -2845,6 +2994,7 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
       training_sample_indices=outer_train_indices,
       random_seed=config.random_seed,
       logistic_c=config.logistic_c,
+      rfecv_inner_splits=config.rfecv_inner_splits,
     )
 
     train_features = apply_feature_selection(train_base_features, selection)
@@ -2856,6 +3006,16 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
       validation_features,
       test_features,
     )
+    train_features, feature_transformer, feature_transform_summary = fit_feature_transform(
+      train_features,
+      config,
+    )
+    validation_features, test_features = apply_feature_transform(
+      feature_transformer,
+      validation_features,
+      test_features,
+    )
+    actual_selected_feature_count = int(train_features.shape[1])
 
     train_labels = labels_from_abide[train_indices]
     validation_labels = labels_from_abide[validation_indices]
@@ -2863,7 +3023,7 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
 
     if verbose:
       print(
-        f"Fold {fold_id}: selected {selected_feature_count} features "
+        f"Fold {fold_id}: selected {actual_selected_feature_count} features "
         f"from {roi_lookup.shape[0]} candidates"
       )
 
@@ -2907,7 +3067,7 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
       validation_indices=validation_indices,
       test_indices=test_indices,
       selection=selection,
-      selected_feature_count=selected_feature_count,
+      selected_feature_count=actual_selected_feature_count,
       metrics=metrics,
       true_labels=true_labels,
       predicted_labels=predicted_labels,
@@ -2916,6 +3076,7 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
       test_feature_shape=test_features.shape,
       scaler_mean=np.asarray(scaling_summary['mean'], dtype=float),
       scaler_scale=np.asarray(scaling_summary['scale'], dtype=float),
+      feature_transform_summary=feature_transform_summary,
       feature_count_tuning_records=feature_count_tuning_records,
       training_summary=training_summary,
       confound_summary={
@@ -3166,8 +3327,11 @@ def parse_reanalysis_log(log_path):
     'preprocessing_condition',
     'roi_atlas',
     'feature_representation',
+    'feature_transform',
+    'pca_components',
     'model_type',
     'selector_type',
+    'rfecv_inner_splits',
     'ssae_dropout_rate',
     'harmonization_method',
     'enable_confound_regression',
@@ -3555,7 +3719,9 @@ if __name__ == "__main__":
   parser.add_argument('--roi_atlas', default=DEFAULT_ROI_ATLAS, help='ROI atlas directory to load, e.g. rois_aal, rois_cc200, rois_cc400, rois_ho, rois_dosenbach160, rois_ez, rois_tt')
   parser.add_argument('--num_selected_features', type=int, default=1000, help='Number of fold-local features to keep when an explicit selector is used. Ignored when --selector_type none.')
   parser.add_argument('--feature_representation', default=DEFAULT_FEATURE_REPRESENTATION, help='Connectivity representation to build before fold-local selection. Options: edge_vector, graph_summary, tangent_vector, partial_correlation_vector')
-  parser.add_argument('--selector_type', default='rfe', help='Feature selector to use inside each fold. Options: rfe, anova_f, mutual_info, logistic_l1, none')
+  parser.add_argument('--feature_transform', default='none', help='Optional fold-local transform applied after selection and scaling. Options: none, pca')
+  parser.add_argument('--pca_components', type=int, default=0, help='Number of PCA components when --feature_transform pca. Use 0 to keep the full rank allowed by the training fold.')
+  parser.add_argument('--selector_type', default='rfe', help='Feature selector to use inside each fold. Options: rfe, rfecv, anova_f, mutual_info, logistic_l1, mrmr, none')
   parser.add_argument('--model_type', default='ssae', help='Model to train on the selected features. Options: ssae, linear_svm, logistic_l1, logistic_elastic_net, hist_gradient_boosting')
   parser.add_argument('--ae1_hidden_size', type=int, default=500, help='Hidden size for the first autoencoder layer.')
   parser.add_argument('--ae2_hidden_size', type=int, default=100, help='Hidden size for the second autoencoder layer.')
@@ -3563,6 +3729,7 @@ if __name__ == "__main__":
   parser.add_argument('--feature_count_candidates', nargs='*', type=int, default=None, help='Optional feature-count candidates to tune inside each training fold, e.g. --feature_count_candidates 250 500 750 1000')
   parser.add_argument('--feature_count_selection_metric', default='f1', help='Validation metric used to choose feature count. Options: accuracy, sensitivity, specificity, precision, f1')
   parser.add_argument('--rfe_step', type=int, default=20, help='SVM-RFE elimination step size.')
+  parser.add_argument('--rfecv_inner_splits', type=int, default=3, help='Inner CV splits used when --selector_type rfecv.')
   parser.add_argument('--ae1_epochs', type=int, default=50, help='Maximum epochs for the first autoencoder pretraining stage.')
   parser.add_argument('--ae2_epochs', type=int, default=50, help='Maximum epochs for the second autoencoder pretraining stage.')
   parser.add_argument('--classifier_epochs', type=int, default=300, help='Maximum epochs for the classifier stage.')
@@ -3629,8 +3796,11 @@ if __name__ == "__main__":
   print("preprocessing_condition: ", args.preprocessing_condition)
   print("roi_atlas: ", args.roi_atlas)
   print("feature_representation: ", args.feature_representation)
+  print("feature_transform: ", args.feature_transform)
+  print("pca_components: ", args.pca_components)
   print("model_type: ", args.model_type)
   print("selector_type: ", args.selector_type)
+  print("rfecv_inner_splits: ", args.rfecv_inner_splits)
   print("ssae_dropout_rate: ", args.ssae_dropout_rate)
   print("harmonization_method: ", args.harmonization_method)
   print("enable_confound_regression: ", args.enable_confound_regression)
@@ -3669,7 +3839,10 @@ if __name__ == "__main__":
     roi_atlas=args.roi_atlas,
     num_selected_features=args.num_selected_features,
     feature_representation=args.feature_representation,
+    feature_transform=args.feature_transform,
+    pca_components=args.pca_components,
     selector_type=args.selector_type,
+    rfecv_inner_splits=args.rfecv_inner_splits,
     model_type=args.model_type,
     ae1_epochs=args.ae1_epochs,
     ae2_epochs=args.ae2_epochs,

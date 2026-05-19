@@ -136,6 +136,39 @@ class LeakFreeReanalysisTests(unittest.TestCase):
         np.testing.assert_array_equal(selection.selected_feature_indices, np.arange(7))
         np.testing.assert_array_equal(selection.selected_roi_pairs, feature_indices)
 
+    def test_rfecv_selector_returns_nonempty_subset(self):
+        feature_vectors, labels, feature_indices = make_synthetic_feature_matrix(num_samples=30, num_features=10)
+
+        selection = get_top_features_from_selector(
+            feature_vectors,
+            labels,
+            feature_indices,
+            N=6,
+            step=1,
+            selector_type='rfecv',
+            training_sample_indices=np.arange(len(feature_vectors)),
+            rfecv_inner_splits=3,
+        )
+
+        self.assertGreaterEqual(len(selection.selected_feature_indices), 1)
+        self.assertLessEqual(len(selection.selected_feature_indices), feature_vectors.shape[1])
+
+    def test_mrmr_selector_returns_requested_feature_count(self):
+        feature_vectors, labels, feature_indices = make_synthetic_feature_matrix(num_samples=30, num_features=12)
+
+        selection = get_top_features_from_selector(
+            feature_vectors,
+            labels,
+            feature_indices,
+            N=5,
+            step=1,
+            selector_type='mrmr',
+            training_sample_indices=np.arange(len(feature_vectors)),
+        )
+
+        self.assertEqual(len(selection.selected_feature_indices), 5)
+        self.assertEqual(selection.selected_roi_pairs.shape, (5, 2))
+
     def test_graph_summary_representation_returns_roi_level_features(self):
         data = [
             np.array([
@@ -271,10 +304,33 @@ class LeakFreeReanalysisTests(unittest.TestCase):
             )
 
         self.assertEqual(len(summary.fold_results), 5)
+
+    def test_train_and_eval_model_applies_pca_inside_each_fold(self):
+        feature_vectors, labels, feature_indices = make_synthetic_feature_matrix(num_samples=30, num_features=8)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.make_fast_config(
+                temp_dir,
+                model_type='linear_svm',
+                selector_type='none',
+                feature_transform='pca',
+                pca_components=3,
+            )
+            summary = train_and_eval_model(
+                feature_vectors,
+                labels,
+                pipeline='synthetic',
+                feature_indices=feature_indices,
+                verbose=False,
+                config=config,
+            )
+
         for fold_result in summary.fold_results:
-            self.assertEqual(fold_result.train_feature_shape[1], 6)
-            self.assertEqual(fold_result.validation_feature_shape[1], 6)
-            self.assertEqual(fold_result.test_feature_shape[1], 6)
+            self.assertEqual(fold_result.train_feature_shape[1], 3)
+            self.assertEqual(fold_result.validation_feature_shape[1], 3)
+            self.assertEqual(fold_result.test_feature_shape[1], 3)
+            self.assertEqual(fold_result.feature_transform_summary['type'], 'pca')
+            self.assertEqual(fold_result.feature_transform_summary['n_components'], 3)
 
     def test_stacked_autoencoder_restores_relu_between_pretrained_encoders(self):
         ae1 = Autoencoder(2, 2)
@@ -668,8 +724,11 @@ class LeakFreeReanalysisTests(unittest.TestCase):
                     "preprocessing_condition:  filt_noglobal",
                     "roi_atlas:  rois_cc200",
                     "feature_representation:  edge_vector",
+                    "feature_transform:  pca",
+                    "pca_components:  1000",
                     "model_type:  ssae",
                     "selector_type:  rfe",
+                    "rfecv_inner_splits:  3",
                     "ssae_dropout_rate:  0.3",
                     "harmonization_method:  combat",
                     "enable_confound_regression:  False",
@@ -688,6 +747,8 @@ class LeakFreeReanalysisTests(unittest.TestCase):
         self.assertEqual(record["preprocessing_condition"], "filt_noglobal")
         self.assertEqual(record["roi_atlas"], "rois_cc200")
         self.assertEqual(record["model_type"], "ssae")
+        self.assertEqual(record["feature_transform"], "pca")
+        self.assertEqual(record["pca_components"], "1000")
         self.assertEqual(record["ssae_dropout_rate"], "0.3")
         self.assertEqual(record["harmonization_method"], "combat")
         self.assertAlmostEqual(record["accuracy_mean"], 0.6470)
