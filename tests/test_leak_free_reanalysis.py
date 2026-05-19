@@ -61,6 +61,21 @@ def make_synthetic_subject_metadata(num_samples=30):
     return pd.DataFrame(rows)
 
 
+def make_synthetic_roi_timeseries_dataset(num_samples=30, num_timepoints=24, num_rois=4):
+    rng = np.random.default_rng(123)
+    labels = np.resize(np.array([0, 1], dtype=int), num_samples)
+    data = []
+
+    for label in labels:
+        shared_signal = rng.normal(0.0, 1.0, size=(num_timepoints, 1))
+        roi_noise = rng.normal(0.0, 0.35, size=(num_timepoints, num_rois))
+        class_pattern = np.linspace(0.2, 0.8, num_rois, dtype=float)
+        class_signal = shared_signal * (class_pattern if label == 0 else class_pattern[::-1])
+        data.append(shared_signal * 0.4 + class_signal + roi_noise)
+
+    return data, labels
+
+
 class LeakFreeReanalysisTests(unittest.TestCase):
     def make_fast_config(self, artifact_root, explanation_methods=(), **overrides):
         config = ReanalysisConfig(
@@ -144,6 +159,31 @@ class LeakFreeReanalysisTests(unittest.TestCase):
         self.assertTrue(np.isfinite(feature_vectors).all())
         np.testing.assert_array_equal(feature_indices[0, :, 0], feature_indices[0, :, 1])
 
+    def test_tangent_representation_returns_fold_fitted_edge_features(self):
+        data, _ = make_synthetic_roi_timeseries_dataset(num_samples=6, num_timepoints=20, num_rois=4)
+
+        feature_vectors, feature_indices = get_feature_vecs(
+            data[4:],
+            feature_representation="tangent_vector",
+            fit_data=data[:4],
+        )
+
+        self.assertEqual(feature_vectors.shape, (2, 6))
+        self.assertEqual(feature_indices.shape, (6, 2))
+        self.assertTrue(np.isfinite(feature_vectors).all())
+
+    def test_partial_correlation_representation_returns_finite_edge_features(self):
+        data, _ = make_synthetic_roi_timeseries_dataset(num_samples=5, num_timepoints=20, num_rois=4)
+
+        feature_vectors, feature_indices = get_feature_vecs(
+            data,
+            feature_representation="partial_correlation_vector",
+        )
+
+        self.assertEqual(feature_vectors.shape, (5, 6))
+        self.assertEqual(feature_indices.shape, (6, 2))
+        self.assertTrue(np.isfinite(feature_vectors).all())
+
     def test_graph_summary_representation_skips_edge_level_explanations(self):
         config = self.make_fast_config(
             'artifacts/test',
@@ -160,7 +200,7 @@ class LeakFreeReanalysisTests(unittest.TestCase):
         )
 
         self.assertIn('Integrated Gradients', explanations)
-        self.assertIn('edge_vector features', explanations['Integrated Gradients'].skipped_reason)
+        self.assertIn('edge-based connectivity features', explanations['Integrated Gradients'].skipped_reason)
 
     def test_resolve_abide_download_dir_supports_custom_condition_and_atlas(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -205,6 +245,36 @@ class LeakFreeReanalysisTests(unittest.TestCase):
             self.assertEqual(fold_result.train_feature_shape[1], len(fold_result.selection.selected_feature_indices))
             self.assertEqual(fold_result.validation_feature_shape[1], len(fold_result.selection.selected_feature_indices))
             self.assertEqual(fold_result.test_feature_shape[1], len(fold_result.selection.selected_feature_indices))
+
+    def test_train_and_eval_model_supports_tangent_representation_with_raw_data(self):
+        data, labels = make_synthetic_roi_timeseries_dataset(num_samples=20, num_timepoints=18, num_rois=4)
+        feature_indices = np.array([[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]], dtype=int)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.make_fast_config(
+                temp_dir,
+                model_type='linear_svm',
+                selector_type='none',
+                feature_representation='tangent_vector',
+            )
+            summary = train_and_eval_model(
+                None,
+                labels,
+                pipeline='synthetic_tangent',
+                feature_indices=feature_indices,
+                subject_metadata=make_synthetic_subject_metadata(num_samples=20),
+                verbose=False,
+                train_model=True,
+                save_model=False,
+                config=config,
+                raw_data=data,
+            )
+
+        self.assertEqual(len(summary.fold_results), 5)
+        for fold_result in summary.fold_results:
+            self.assertEqual(fold_result.train_feature_shape[1], 6)
+            self.assertEqual(fold_result.validation_feature_shape[1], 6)
+            self.assertEqual(fold_result.test_feature_shape[1], 6)
 
     def test_stacked_autoencoder_restores_relu_between_pretrained_encoders(self):
         ae1 = Autoencoder(2, 2)

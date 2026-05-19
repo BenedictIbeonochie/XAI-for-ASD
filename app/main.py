@@ -28,10 +28,12 @@ from sklearn.feature_selection import RFE, f_classif, mutual_info_classif
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
+from sklearn.covariance import LedoitWolf
 from sklearn.svm import LinearSVC
 from sklearn.ensemble import HistGradientBoostingClassifier
 from captum.attr import IntegratedGradients, DeepLiftShap, DeepLift, GradientShap, ShapleyValueSampling, ShapleyValues, FeatureAblation, GuidedBackprop, Occlusion
 from nilearn import datasets, plotting
+from nilearn.connectome import ConnectivityMeasure
 import networkx as nx
 from functools import reduce
 from sklearn.metrics import jaccard_score
@@ -197,9 +199,13 @@ def normalize_feature_representation(feature_representation):
     return "edge_vector"
   if normalized_representation in {"graph_summary", "node_summary", "node_profile"}:
     return "graph_summary"
+  if normalized_representation in {"tangent_vector", "tangent", "riemannian", "riemannian_connectivity"}:
+    return "tangent_vector"
+  if normalized_representation in {"partial_correlation_vector", "partial_correlation", "partial-correlation", "partial"}:
+    return "partial_correlation_vector"
   raise ValueError(
     f"Unknown feature_representation '{feature_representation}'. "
-    "Supported options: edge_vector, graph_summary."
+    "Supported options: edge_vector, graph_summary, tangent_vector, partial_correlation_vector."
   )
 
 
@@ -210,6 +216,77 @@ def compute_fisher_connectivity_matrix(subject_roi_timeseries):
   transformed_corr_coefs = sanitize_feature_matrix(transformed_corr_coefs)
   np.fill_diagonal(transformed_corr_coefs, 0.0)
   return transformed_corr_coefs
+
+
+def uses_fold_fitted_connectivity_measure(feature_representation):
+  normalized_representation = normalize_feature_representation(feature_representation)
+  return normalized_representation in {"tangent_vector", "partial_correlation_vector"}
+
+
+def is_edge_level_feature_representation(feature_representation):
+  normalized_representation = normalize_feature_representation(feature_representation)
+  return normalized_representation in {"edge_vector", "tangent_vector", "partial_correlation_vector"}
+
+
+def build_edge_feature_indices(roi_size):
+  lower_triangular_indices = np.tril_indices(int(roi_size), -1)
+  return np.column_stack(lower_triangular_indices).astype(int)
+
+
+def get_feature_indices_for_representation(roi_size, feature_representation):
+  feature_representation = normalize_feature_representation(feature_representation)
+
+  if feature_representation in {"edge_vector", "tangent_vector", "partial_correlation_vector"}:
+    return build_edge_feature_indices(roi_size)
+
+  if feature_representation == "graph_summary":
+    node_feature_indices = np.tile(np.arange(int(roi_size), dtype=int), 6)
+    return np.column_stack((node_feature_indices, node_feature_indices)).astype(int)
+
+  raise ValueError(
+    f"Unknown feature_representation '{feature_representation}'. "
+    "Supported options: edge_vector, graph_summary, tangent_vector, partial_correlation_vector."
+  )
+
+
+def build_connectivity_measure(feature_representation):
+  feature_representation = normalize_feature_representation(feature_representation)
+
+  if feature_representation == "tangent_vector":
+    connectivity_kind = "tangent"
+  elif feature_representation == "partial_correlation_vector":
+    connectivity_kind = "partial correlation"
+  else:
+    raise ValueError(
+      f"ConnectivityMeasure is not used for feature_representation '{feature_representation}'."
+    )
+
+  return ConnectivityMeasure(
+    kind=connectivity_kind,
+    cov_estimator=LedoitWolf(store_precision=False),
+    vectorize=True,
+    discard_diagonal=True,
+    standardize=True,
+  )
+
+
+def select_subject_timeseries(data, indices):
+  return [data[int(index)] for index in np.asarray(indices, dtype=int)]
+
+
+def build_fold_connectivity_measure_features(raw_data, fit_indices, transform_indices, feature_representation):
+  fit_subjects = select_subject_timeseries(raw_data, fit_indices)
+  transform_subjects = [select_subject_timeseries(raw_data, indices) for indices in transform_indices]
+
+  measure = build_connectivity_measure(feature_representation)
+  measure.fit(fit_subjects)
+
+  transformed_feature_sets = [
+    sanitize_feature_matrix(measure.transform(subjects))
+    for subjects in transform_subjects
+  ]
+
+  return transformed_feature_sets
 
 
 def build_edge_vector_features(data):
@@ -272,17 +349,26 @@ def build_graph_summary_features(data):
   return np.asarray(feature_vecs, dtype=float), np.asarray(feature_indices, dtype=int)
 
 
-def get_feature_vecs(data, feature_representation=DEFAULT_FEATURE_REPRESENTATION):
+def get_feature_vecs(data, feature_representation=DEFAULT_FEATURE_REPRESENTATION, fit_data=None):
   feature_representation = normalize_feature_representation(feature_representation)
 
   if feature_representation == 'edge_vector':
     return build_edge_vector_features(data)
   if feature_representation == 'graph_summary':
     return build_graph_summary_features(data)
+  if feature_representation in {'tangent_vector', 'partial_correlation_vector'}:
+    if not data:
+      raise ValueError("data must contain at least one subject to build connectivity features.")
+    reference_data = list(fit_data) if fit_data is not None else list(data)
+    measure = build_connectivity_measure(feature_representation)
+    measure.fit(reference_data)
+    feature_vecs = sanitize_feature_matrix(measure.transform(list(data)))
+    feature_indices = get_feature_indices_for_representation(data[0].shape[1], feature_representation)
+    return feature_vecs, feature_indices
 
   raise ValueError(
     f"Unknown feature_representation '{feature_representation}'. "
-    "Supported options: edge_vector, graph_summary."
+    "Supported options: edge_vector, graph_summary, tangent_vector, partial_correlation_vector."
   )
 
 def get_top_features_from_selector(
@@ -2308,8 +2394,9 @@ def evaluate_sklearn_model(model, test_features, test_labels):
   return metrics, true_labels, predicted_labels
 
 
-def select_feature_count_for_fold(feature_vectors, labels_from_abide, roi_lookup, train_indices, validation_indices, config, subject_metadata=None, verbose=False):
-  candidate_feature_counts = get_candidate_feature_counts(config, feature_vectors.shape[1])
+def select_feature_count_for_fold(feature_vectors, labels_from_abide, roi_lookup, train_indices, validation_indices, config, subject_metadata=None, verbose=False, raw_data=None):
+  max_feature_count = roi_lookup.shape[0] if feature_vectors is None else feature_vectors.shape[1]
+  candidate_feature_counts = get_candidate_feature_counts(config, max_feature_count)
 
   if len(candidate_feature_counts) == 1:
     return candidate_feature_counts[0], []
@@ -2323,11 +2410,25 @@ def select_feature_count_for_fold(feature_vectors, labels_from_abide, roi_lookup
 
   train_metadata = subject_metadata.iloc[train_indices] if subject_metadata is not None else None
   validation_metadata = subject_metadata.iloc[validation_indices] if subject_metadata is not None else None
+
+  if feature_vectors is None:
+    if raw_data is None:
+      raise ValueError("raw_data must be provided when feature_vectors are built inside each fold.")
+    candidate_train_fold_features, candidate_validation_fold_features = build_fold_connectivity_measure_features(
+      raw_data,
+      fit_indices=train_indices,
+      transform_indices=(train_indices, validation_indices),
+      feature_representation=config.feature_representation,
+    )
+  else:
+    candidate_train_fold_features = feature_vectors[train_indices]
+    candidate_validation_fold_features = feature_vectors[validation_indices]
+
   candidate_train_harmonized_features, [candidate_validation_harmonized_features], harmonization_summary = harmonize_feature_sets(
-    feature_vectors[train_indices],
+    candidate_train_fold_features,
     train_metadata,
     config,
-    (feature_vectors[validation_indices], validation_metadata),
+    (candidate_validation_fold_features, validation_metadata),
   )
   candidate_train_base_features, [candidate_validation_base_features], confound_summary = regress_out_confounds(
     candidate_train_harmonized_features,
@@ -2416,11 +2517,11 @@ def compute_fold_explanations(model, train_dataloader, test_dataloader, selected
   method_map = get_interpretability_method_map()
   feature_representation = normalize_feature_representation(config.feature_representation)
 
-  if feature_representation != 'edge_vector':
+  if not is_edge_level_feature_representation(feature_representation):
     for method_name in config.explanation_methods:
       explanation_rankings[method_name] = ExplanationRanking(
         skipped_reason=(
-          f"Interpretation method '{method_name}' is only aggregated for edge_vector features. "
+          f"Interpretation method '{method_name}' is only aggregated for edge-based connectivity features. "
           f"Current feature_representation is '{config.feature_representation}'."
         ),
       )
@@ -2621,7 +2722,7 @@ def write_pipeline_artifacts(summary):
   write_json_file(artifact_dir / 'summary.json', summary)
 
 
-def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown', feature_indices=None, subject_metadata=None, verbose=False, train_model=True, save_model=False, rfe_step=None, config=None):
+def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown', feature_indices=None, subject_metadata=None, verbose=False, train_model=True, save_model=False, rfe_step=None, config=None, raw_data=None):
   if config is None:
     config = ReanalysisConfig()
 
@@ -2636,19 +2737,36 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
   if feature_indices is None:
     raise ValueError("feature_indices must be provided for the corrected fold-specific reanalysis.")
 
-  feature_vectors = sanitize_feature_matrix(feature_vectors)
+  feature_representation = normalize_feature_representation(config.feature_representation)
+  builds_features_inside_fold = uses_fold_fitted_connectivity_measure(feature_representation)
+
+  if feature_vectors is not None:
+    feature_vectors = sanitize_feature_matrix(feature_vectors)
+  elif not builds_features_inside_fold:
+    raise ValueError("feature_vectors must be provided unless the feature representation is built inside each fold.")
+
   labels_from_abide = np.asarray(labels_from_abide, dtype=int)
   roi_lookup = prepare_feature_index_lookup(feature_indices)
   if subject_metadata is not None:
     subject_metadata = prepare_subject_metadata(subject_metadata)
 
-  if feature_vectors.ndim != 2:
+  if raw_data is not None:
+    raw_data = list(raw_data)
+    if len(raw_data) != len(labels_from_abide):
+      raise ValueError("raw_data must contain one subject time-series array per label.")
+
+  if feature_vectors is not None and feature_vectors.ndim != 2:
     raise ValueError("feature_vectors must be a 2D array of shape (samples, features).")
+  if builds_features_inside_fold and raw_data is None:
+    raise ValueError(
+      f"feature_representation '{config.feature_representation}' must receive raw_data so it can be fit inside each fold."
+    )
   if str(config.harmonization_method).strip().lower() not in {'', 'none'} and config.enable_confound_regression:
     raise ValueError("Use either ComBat harmonization or confound regression, not both in the same run.")
 
   set_random_seed(config.random_seed)
   skf = StratifiedKFold(n_splits=config.n_splits, shuffle=True, random_state=config.random_seed)
+  split_reference = feature_vectors if feature_vectors is not None else np.zeros((len(labels_from_abide), 1), dtype=float)
 
   pipeline_artifact_dir = None
   if config.save_artifacts:
@@ -2656,7 +2774,7 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
 
   fold_results = []
 
-  for fold_id, (outer_train_indices, test_indices) in enumerate(skf.split(feature_vectors, labels_from_abide), start=1):
+  for fold_id, (outer_train_indices, test_indices) in enumerate(skf.split(split_reference, labels_from_abide), start=1):
     if verbose:
       print(f"======================================\nFold {fold_id}\n======================================")
 
@@ -2679,6 +2797,7 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
       config,
       subject_metadata=subject_metadata,
       verbose=verbose,
+      raw_data=raw_data,
     )
 
     outer_train_metadata = subject_metadata.iloc[outer_train_indices] if subject_metadata is not None else None
@@ -2686,13 +2805,26 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
     validation_metadata = subject_metadata.iloc[validation_indices] if subject_metadata is not None else None
     test_metadata = subject_metadata.iloc[test_indices] if subject_metadata is not None else None
 
+    if feature_vectors is None:
+      outer_train_fold_features, train_fold_features, validation_fold_features, test_fold_features = build_fold_connectivity_measure_features(
+        raw_data,
+        fit_indices=outer_train_indices,
+        transform_indices=(outer_train_indices, train_indices, validation_indices, test_indices),
+        feature_representation=config.feature_representation,
+      )
+    else:
+      outer_train_fold_features = feature_vectors[outer_train_indices]
+      train_fold_features = feature_vectors[train_indices]
+      validation_fold_features = feature_vectors[validation_indices]
+      test_fold_features = feature_vectors[test_indices]
+
     outer_train_harmonized_features, [train_harmonized_features, validation_harmonized_features, test_harmonized_features], harmonization_summary = harmonize_feature_sets(
-      feature_vectors[outer_train_indices],
+      outer_train_fold_features,
       outer_train_metadata,
       config,
-      (feature_vectors[train_indices], train_metadata),
-      (feature_vectors[validation_indices], validation_metadata),
-      (feature_vectors[test_indices], test_metadata),
+      (train_fold_features, train_metadata),
+      (validation_fold_features, validation_metadata),
+      (test_fold_features, test_metadata),
     )
     outer_train_selection_features, [train_base_features, validation_base_features, test_base_features], confound_summary = regress_out_confounds(
       outer_train_harmonized_features,
@@ -2732,7 +2864,7 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
     if verbose:
       print(
         f"Fold {fold_id}: selected {selected_feature_count} features "
-        f"from {feature_vectors.shape[1]} candidates"
+        f"from {roi_lookup.shape[0]} candidates"
       )
 
     model, training_summary = train_fold_model(
@@ -3113,10 +3245,16 @@ def run_pipeline_reanalysis(pipeline, verbose=False, config=None):
     roi_atlas=config.roi_atlas,
     return_subject_metadata=True,
   )
-  feature_vectors, feature_indices = get_feature_vecs(
-    data,
-    feature_representation=config.feature_representation,
-  )
+  feature_representation = normalize_feature_representation(config.feature_representation)
+  raw_data = data if uses_fold_fitted_connectivity_measure(feature_representation) else None
+  if raw_data is None:
+    feature_vectors, feature_indices = get_feature_vecs(
+      data,
+      feature_representation=feature_representation,
+    )
+  else:
+    feature_vectors = None
+    feature_indices = get_feature_indices_for_representation(data[0].shape[1], feature_representation)
   return train_and_eval_model(
     feature_vectors,
     labels,
@@ -3128,10 +3266,11 @@ def run_pipeline_reanalysis(pipeline, verbose=False, config=None):
     save_model=False,
     rfe_step=config.rfe_step if config is not None else None,
     config=config,
+    raw_data=raw_data,
   )
 
 
-def run_permutation_test(feature_vectors, labels, feature_indices, pipeline, config, subject_metadata=None, n_permutations=100, verbose=False):
+def run_permutation_test(feature_vectors, labels, feature_indices, pipeline, config, subject_metadata=None, n_permutations=100, verbose=False, raw_data=None):
   rng = np.random.default_rng(config.random_seed)
   observed_summary = train_and_eval_model(
     feature_vectors,
@@ -3144,6 +3283,7 @@ def run_permutation_test(feature_vectors, labels, feature_indices, pipeline, con
     save_model=False,
     rfe_step=config.rfe_step,
     config=config,
+    raw_data=raw_data,
   )
 
   permutation_accuracies = []
@@ -3166,6 +3306,7 @@ def run_permutation_test(feature_vectors, labels, feature_indices, pipeline, con
       save_model=False,
       rfe_step=permutation_config.rfe_step,
       config=permutation_config,
+      raw_data=raw_data,
     )
     permutation_accuracies.append(permutation_summary.metrics_summary['accuracy']['mean'])
     permutation_f1_scores.append(permutation_summary.metrics_summary['f1']['mean'])
@@ -3413,7 +3554,7 @@ if __name__ == "__main__":
   parser.add_argument('--preprocessing_condition', default=DEFAULT_PREPROCESSING_CONDITION, help='ABIDE preprocessing condition directory to load, e.g. filt_global, filt_noglobal, nofilt_global, nofilt_noglobal')
   parser.add_argument('--roi_atlas', default=DEFAULT_ROI_ATLAS, help='ROI atlas directory to load, e.g. rois_aal, rois_cc200, rois_cc400, rois_ho, rois_dosenbach160, rois_ez, rois_tt')
   parser.add_argument('--num_selected_features', type=int, default=1000, help='Number of fold-local features to keep when an explicit selector is used. Ignored when --selector_type none.')
-  parser.add_argument('--feature_representation', default=DEFAULT_FEATURE_REPRESENTATION, help='Connectivity representation to build before fold-local selection. Options: edge_vector, graph_summary')
+  parser.add_argument('--feature_representation', default=DEFAULT_FEATURE_REPRESENTATION, help='Connectivity representation to build before fold-local selection. Options: edge_vector, graph_summary, tangent_vector, partial_correlation_vector')
   parser.add_argument('--selector_type', default='rfe', help='Feature selector to use inside each fold. Options: rfe, anova_f, mutual_info, logistic_l1, none')
   parser.add_argument('--model_type', default='ssae', help='Model to train on the selected features. Options: ssae, linear_svm, logistic_l1, logistic_elastic_net, hist_gradient_boosting')
   parser.add_argument('--ae1_hidden_size', type=int, default=500, help='Hidden size for the first autoencoder layer.')
@@ -3656,10 +3797,16 @@ if __name__ == "__main__":
       roi_atlas=base_config.roi_atlas,
       return_subject_metadata=True,
     )
-    ccs_feature_vectors, ccs_feature_indices = get_feature_vecs(
-      ccs_data,
-      feature_representation=base_config.feature_representation,
-    )
+    permutation_representation = normalize_feature_representation(base_config.feature_representation)
+    permutation_raw_data = ccs_data if uses_fold_fitted_connectivity_measure(permutation_representation) else None
+    if permutation_raw_data is None:
+      ccs_feature_vectors, ccs_feature_indices = get_feature_vecs(
+        ccs_data,
+        feature_representation=permutation_representation,
+      )
+    else:
+      ccs_feature_vectors = None
+      ccs_feature_indices = get_feature_indices_for_representation(ccs_data[0].shape[1], permutation_representation)
     permutation_config = ReanalysisConfig(**asdict(base_config))
     permutation_config.explanation_methods = ()
     observed_summary, permutation_results = run_permutation_test(
@@ -3671,6 +3818,7 @@ if __name__ == "__main__":
       subject_metadata=ccs_subject_metadata,
       n_permutations=args.num_permutations,
       verbose=verbose,
+      raw_data=permutation_raw_data,
     )
     pipeline_summaries['ccs'] = observed_summary
     print(json.dumps(permutation_results, indent=2))
