@@ -248,6 +248,21 @@ class LeakFreeReanalysisTests(unittest.TestCase):
         self.assertEqual(tuple(image_tensor.shape), (4, 3, 32, 32))
         self.assertTrue(torch.isfinite(image_tensor).all())
 
+    def test_prepare_transfer_learning_images_supports_single_channel_connectivity_cnn(self):
+        feature_vectors, _, feature_indices = make_synthetic_feature_matrix(num_samples=4, num_features=6)
+        image_tensor = prepare_transfer_learning_images(
+            feature_vectors,
+            feature_indices,
+            roi_count=7,
+            image_size=32,
+            num_channels=1,
+            per_subject_minmax=False,
+            imagenet_normalize=False,
+        )
+
+        self.assertEqual(tuple(image_tensor.shape), (4, 1, 32, 32))
+        self.assertTrue(torch.isfinite(image_tensor).all())
+
     def test_resolve_abide_download_dir_supports_custom_condition_and_atlas(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             downloads_root = Path(temp_dir) / "Outputs"
@@ -345,6 +360,32 @@ class LeakFreeReanalysisTests(unittest.TestCase):
         self.assertEqual(len(summary.fold_results), 3)
         self.assertEqual(summary.fold_results[0].training_summary['model_type'], 'resnet18_transfer')
         self.assertFalse(summary.fold_results[0].training_summary['transfer_learning']['pretrained_loaded'])
+
+    def test_train_and_eval_model_supports_connectivity_cnn(self):
+        feature_vectors, labels, feature_indices = make_synthetic_feature_matrix(num_samples=18, num_features=6)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.make_fast_config(
+                temp_dir,
+                n_splits=3,
+                model_type='connectivity_cnn',
+                selector_type='none',
+                feature_transform='none',
+                classifier_epochs=1,
+                transfer_image_size=32,
+            )
+            summary = train_and_eval_model(
+                feature_vectors,
+                labels,
+                pipeline='synthetic',
+                feature_indices=feature_indices,
+                verbose=False,
+                config=config,
+            )
+
+        self.assertEqual(len(summary.fold_results), 3)
+        self.assertEqual(summary.fold_results[0].training_summary['model_type'], 'connectivity_cnn')
+        self.assertEqual(summary.fold_results[0].training_summary['transfer_learning']['input_channels'], 1)
 
     def test_train_and_eval_model_applies_pca_inside_each_fold(self):
         feature_vectors, labels, feature_indices = make_synthetic_feature_matrix(num_samples=30, num_features=8)

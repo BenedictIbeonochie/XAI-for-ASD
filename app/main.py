@@ -822,29 +822,65 @@ def build_connectivity_matrix_tensor(features, roi_pairs, roi_count):
   return matrix_tensor
 
 
-def prepare_transfer_learning_images(features, roi_pairs, roi_count, image_size):
+def prepare_transfer_learning_images(
+  features,
+  roi_pairs,
+  roi_count,
+  image_size,
+  num_channels=3,
+  per_subject_minmax=True,
+  imagenet_normalize=True,
+):
   matrices = build_connectivity_matrix_tensor(features, roi_pairs, roi_count)
   image_tensor = torch.tensor(matrices, dtype=torch.float32).unsqueeze(1)
 
-  min_values = image_tensor.amin(dim=(2, 3), keepdim=True)
-  max_values = image_tensor.amax(dim=(2, 3), keepdim=True)
-  denominators = torch.where((max_values - min_values) > 0, max_values - min_values, torch.ones_like(max_values))
-  image_tensor = (image_tensor - min_values) / denominators
-  image_tensor = image_tensor.repeat(1, 3, 1, 1)
+  if per_subject_minmax:
+    min_values = image_tensor.amin(dim=(2, 3), keepdim=True)
+    max_values = image_tensor.amax(dim=(2, 3), keepdim=True)
+    denominators = torch.where((max_values - min_values) > 0, max_values - min_values, torch.ones_like(max_values))
+    image_tensor = (image_tensor - min_values) / denominators
+
+  num_channels = int(num_channels)
+  if num_channels == 3:
+    image_tensor = image_tensor.repeat(1, 3, 1, 1)
+  elif num_channels != 1:
+    raise ValueError(f"Unsupported num_channels '{num_channels}'. Use 1 or 3.")
 
   image_size = max(32, int(image_size))
   if image_tensor.shape[-1] != image_size or image_tensor.shape[-2] != image_size:
     image_tensor = F.interpolate(image_tensor, size=(image_size, image_size), mode='bilinear', align_corners=False)
 
-  imagenet_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
-  imagenet_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
-  image_tensor = (image_tensor - imagenet_mean) / imagenet_std
+  if imagenet_normalize:
+    if num_channels != 3:
+      raise ValueError("ImageNet normalization requires a 3-channel image tensor.")
+    imagenet_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
+    imagenet_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
+    image_tensor = (image_tensor - imagenet_mean) / imagenet_std
 
   return image_tensor
 
 
-def build_transfer_learning_dataloader(features, labels, roi_pairs, roi_count, image_size, batch_size, shuffle):
-  image_tensor = prepare_transfer_learning_images(features, roi_pairs, roi_count, image_size)
+def build_transfer_learning_dataloader(
+  features,
+  labels,
+  roi_pairs,
+  roi_count,
+  image_size,
+  batch_size,
+  shuffle,
+  num_channels=3,
+  per_subject_minmax=True,
+  imagenet_normalize=True,
+):
+  image_tensor = prepare_transfer_learning_images(
+    features,
+    roi_pairs,
+    roi_count,
+    image_size,
+    num_channels=num_channels,
+    per_subject_minmax=per_subject_minmax,
+    imagenet_normalize=imagenet_normalize,
+  )
   labels_tensor = torch.tensor(np.asarray(labels), dtype=torch.long)
   dataset = TensorDataset(image_tensor, labels_tensor)
   return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0)
@@ -860,6 +896,10 @@ def normalize_selector_type(selector_type):
 
 def is_transfer_learning_model(model_type):
   return normalize_model_type(model_type) in {'resnet18_transfer', 'efficientnet_b0_transfer'}
+
+
+def is_connectivity_image_model(model_type):
+  return normalize_model_type(model_type) in {'resnet18_transfer', 'efficientnet_b0_transfer', 'connectivity_cnn'}
 
 
 def normalize_feature_transform(feature_transform):
@@ -1804,6 +1844,33 @@ class TransferLearningClassifier(nn.Module):
       features = torch.flatten(features, 1)
     features = self.dropout(features)
     return self.classifier(features)
+
+
+class ConnectivityCNNClassifier(nn.Module):
+  def __init__(self, dropout_rate=0.2, num_classes=2, base_channels=16):
+    super(ConnectivityCNNClassifier, self).__init__()
+    self.feature_extractor = nn.Sequential(
+      nn.Conv2d(1, base_channels, kernel_size=3, padding=1),
+      nn.BatchNorm2d(base_channels),
+      nn.ReLU(inplace=True),
+      nn.MaxPool2d(kernel_size=2),
+      nn.Conv2d(base_channels, base_channels * 2, kernel_size=3, padding=1),
+      nn.BatchNorm2d(base_channels * 2),
+      nn.ReLU(inplace=True),
+      nn.MaxPool2d(kernel_size=2),
+      nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size=3, padding=1),
+      nn.BatchNorm2d(base_channels * 4),
+      nn.ReLU(inplace=True),
+      nn.AdaptiveAvgPool2d((1, 1)),
+    )
+    self.dropout = nn.Dropout(p=float(max(0.0, dropout_rate)))
+    self.classifier = nn.Linear(base_channels * 4, num_classes)
+
+  def forward(self, x):
+    features = self.feature_extractor(x)
+    features = torch.flatten(features, 1)
+    features = self.dropout(features)
+    return self.classifier(features)
   
 class CustomDataset(Dataset):
   def __init__(self, data, labels):
@@ -2380,10 +2447,26 @@ def model_predict_lime(model, data):
 
 
 def build_transfer_learning_model(config):
+  model_type = normalize_model_type(config.model_type)
+
+  if model_type == 'connectivity_cnn':
+    model = ConnectivityCNNClassifier(
+      dropout_rate=config.transfer_dropout_rate,
+      num_classes=2,
+    ).to(device)
+    return model, {
+      'pretrained_requested': False,
+      'pretrained_loaded': False,
+      'freeze_backbone': False,
+      'image_size': int(config.transfer_image_size),
+      'dropout_rate': float(config.transfer_dropout_rate),
+      'input_channels': 1,
+      'input_normalization': 'scaled_connectivity',
+    }
+
   if tv_models is None:
     raise ImportError("torchvision is required for transfer learning backbones but is not installed.")
 
-  model_type = normalize_model_type(config.model_type)
   pretrained_requested = bool(config.transfer_pretrained)
   pretrained_loaded = False
 
@@ -2430,26 +2513,57 @@ def build_transfer_learning_model(config):
     'freeze_backbone': bool(config.transfer_freeze_backbone),
     'image_size': int(config.transfer_image_size),
     'dropout_rate': float(config.transfer_dropout_rate),
+    'input_channels': 3,
+    'input_normalization': 'per_subject_minmax_imagenet',
   }
 
 
+def build_connectivity_image_dataloader(features, labels, roi_pairs, roi_count, config, shuffle):
+  model_type = normalize_model_type(config.model_type)
+
+  if model_type == 'connectivity_cnn':
+    return build_transfer_learning_dataloader(
+      features,
+      labels,
+      roi_pairs,
+      roi_count,
+      config.transfer_image_size,
+      config.batch_size,
+      shuffle=shuffle,
+      num_channels=1,
+      per_subject_minmax=False,
+      imagenet_normalize=False,
+    )
+
+  return build_transfer_learning_dataloader(
+    features,
+    labels,
+    roi_pairs,
+    roi_count,
+    config.transfer_image_size,
+    config.batch_size,
+    shuffle=shuffle,
+    num_channels=3,
+    per_subject_minmax=True,
+    imagenet_normalize=True,
+  )
+
+
 def train_transfer_learning_model(train_features, train_labels, validation_features, validation_labels, roi_pairs, roi_count, config, verbose=False):
-  train_dataloader = build_transfer_learning_dataloader(
+  train_dataloader = build_connectivity_image_dataloader(
     train_features,
     train_labels,
     roi_pairs,
     roi_count,
-    config.transfer_image_size,
-    config.batch_size,
+    config,
     shuffle=True,
   )
-  validation_dataloader = build_transfer_learning_dataloader(
+  validation_dataloader = build_connectivity_image_dataloader(
     validation_features,
     validation_labels,
     roi_pairs,
     roi_count,
-    config.transfer_image_size,
-    config.batch_size,
+    config,
     shuffle=False,
   )
 
@@ -2630,7 +2744,7 @@ def train_baseline_model(train_features, train_labels, validation_features, vali
   else:
     raise ValueError(
       f"Unknown model_type '{config.model_type}'. "
-      "Supported options: ssae, linear_svm, logistic_l1, logistic_elastic_net, hist_gradient_boosting, resnet18_transfer, efficientnet_b0_transfer."
+      "Supported options: ssae, linear_svm, logistic_l1, logistic_elastic_net, hist_gradient_boosting, resnet18_transfer, efficientnet_b0_transfer, connectivity_cnn."
     )
 
   model.fit(train_features, train_labels)
@@ -2674,9 +2788,9 @@ def train_fold_model(train_features, train_labels, validation_features, validati
       verbose=verbose,
     )
 
-  if is_transfer_learning_model(model_type):
+  if is_connectivity_image_model(model_type):
     if selected_roi_pairs is None or roi_count is None:
-      raise ValueError("selected_roi_pairs and roi_count are required for transfer learning models.")
+      raise ValueError("selected_roi_pairs and roi_count are required for connectivity image models.")
     return train_transfer_learning_model(
       train_features,
       train_labels,
@@ -2815,14 +2929,13 @@ def select_feature_count_for_fold(feature_vectors, labels_from_abide, roi_lookup
     if normalize_model_type(config.model_type) == 'ssae':
       candidate_validation_loader = build_dataloader(candidate_validation_features, candidate_validation_labels, config.batch_size, shuffle=False)
       candidate_metrics, _, _ = evaluate_torch_model(candidate_model, candidate_validation_loader)
-    elif is_transfer_learning_model(config.model_type):
-      candidate_validation_loader = build_transfer_learning_dataloader(
+    elif is_connectivity_image_model(config.model_type):
+      candidate_validation_loader = build_connectivity_image_dataloader(
         candidate_validation_features,
         candidate_validation_labels,
         candidate_selection.selected_roi_pairs,
         infer_roi_count_from_lookup(roi_lookup),
-        config.transfer_image_size,
-        config.batch_size,
+        config,
         shuffle=False,
       )
       candidate_metrics, _, _ = evaluate_torch_model(candidate_model, candidate_validation_loader)
@@ -3130,11 +3243,11 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
     raise ValueError(
       f"feature_representation '{config.feature_representation}' must receive raw_data so it can be fit inside each fold."
     )
-  if is_transfer_learning_model(config.model_type):
+  if is_connectivity_image_model(config.model_type):
     if normalize_feature_transform(config.feature_transform) not in {'', 'none'}:
-      raise ValueError("Transfer learning models require feature_transform='none' so ROI-pair structure is preserved.")
+      raise ValueError("Connectivity image models require feature_transform='none' so ROI-pair structure is preserved.")
     if not is_edge_level_feature_representation(feature_representation):
-      raise ValueError("Transfer learning models require an edge-level feature representation.")
+      raise ValueError("Connectivity image models require an edge-level feature representation.")
   if str(config.harmonization_method).strip().lower() not in {'', 'none'} and config.enable_confound_regression:
     raise ValueError("Use either ComBat harmonization or confound regression, not both in the same run.")
 
@@ -3268,23 +3381,21 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
       train_dataloader = build_dataloader(train_features, train_labels, config.batch_size, shuffle=True)
       test_dataloader = build_dataloader(test_features, test_labels, config.batch_size, shuffle=False)
       metrics, true_labels, predicted_labels = evaluate_torch_model(model, test_dataloader)
-    elif is_transfer_learning_model(config.model_type):
-      train_dataloader = build_transfer_learning_dataloader(
+    elif is_connectivity_image_model(config.model_type):
+      train_dataloader = build_connectivity_image_dataloader(
         train_features,
         train_labels,
         selection.selected_roi_pairs,
         roi_count,
-        config.transfer_image_size,
-        config.batch_size,
+        config,
         shuffle=True,
       )
-      test_dataloader = build_transfer_learning_dataloader(
+      test_dataloader = build_connectivity_image_dataloader(
         test_features,
         test_labels,
         selection.selected_roi_pairs,
         roi_count,
-        config.transfer_image_size,
-        config.batch_size,
+        config,
         shuffle=False,
       )
       metrics, true_labels, predicted_labels = evaluate_torch_model(model, test_dataloader)
@@ -3973,7 +4084,7 @@ if __name__ == "__main__":
   parser.add_argument('--feature_transform', default='none', help='Optional fold-local transform applied after selection and scaling. Options: none, pca')
   parser.add_argument('--pca_components', type=int, default=0, help='Number of PCA components when --feature_transform pca. Use 0 to keep the full rank allowed by the training fold.')
   parser.add_argument('--selector_type', default='rfe', help='Feature selector to use inside each fold. Options: rfe, rfecv, anova_f, mutual_info, logistic_l1, mrmr, none')
-  parser.add_argument('--model_type', default='ssae', help='Model to train on the selected features. Options: ssae, linear_svm, logistic_l1, logistic_elastic_net, hist_gradient_boosting, resnet18_transfer, efficientnet_b0_transfer')
+  parser.add_argument('--model_type', default='ssae', help='Model to train on the selected features. Options: ssae, linear_svm, logistic_l1, logistic_elastic_net, hist_gradient_boosting, resnet18_transfer, efficientnet_b0_transfer, connectivity_cnn')
   parser.add_argument('--ae1_hidden_size', type=int, default=500, help='Hidden size for the first autoencoder layer.')
   parser.add_argument('--ae2_hidden_size', type=int, default=100, help='Hidden size for the second autoencoder layer.')
   parser.add_argument('--ssae_dropout_rate', type=float, default=0.0, help='Dropout rate applied between SSAE encoder layers during supervised classification and fine-tuning.')
