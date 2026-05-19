@@ -48,6 +48,72 @@ def clone_module_state(module: nn.Module) -> dict[str, torch.Tensor]:
     return {key: value.detach().cpu().clone() for key, value in module.state_dict().items()}
 
 
+def safe_divide(numerator: float, denominator: float) -> float:
+    return 0.0 if denominator == 0 else numerator / denominator
+
+
+def compute_balanced_accuracy(metrics: dict) -> float:
+    return float((float(metrics["sensitivity"]) + float(metrics["specificity"])) / 2.0)
+
+
+def compute_class_weight_tensor(labels: np.ndarray) -> torch.Tensor:
+    labels = np.asarray(labels, dtype=int)
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    if unique_labels.size < 2:
+        return torch.ones(2, dtype=torch.float32)
+
+    total_count = float(labels.size)
+    num_classes = int(max(2, unique_labels.size))
+    weights = np.ones(2, dtype=np.float32)
+    for label_value, count in zip(unique_labels, counts):
+        weights[int(label_value)] = total_count / (num_classes * float(count))
+
+    return torch.tensor(weights, dtype=torch.float32)
+
+
+def sparsify_adjacency_matrix(adjacency: np.ndarray, top_k: int = 0) -> np.ndarray:
+    adjacency = np.asarray(adjacency, dtype=np.float32)
+    num_nodes = int(adjacency.shape[0])
+    top_k = int(top_k)
+    if top_k <= 0 or top_k >= num_nodes:
+        return adjacency.copy()
+
+    sparse_adjacency = np.zeros_like(adjacency, dtype=np.float32)
+    for row_index in range(num_nodes):
+        row = adjacency[row_index]
+        absolute_row = np.abs(row).copy()
+        absolute_row[row_index] = -np.inf
+        keep_indices = np.argpartition(absolute_row, -top_k)[-top_k:]
+        sparse_adjacency[row_index, keep_indices] = row[keep_indices]
+
+    transpose_adjacency = sparse_adjacency.T
+    sparse_adjacency = np.where(
+        np.abs(sparse_adjacency) >= np.abs(transpose_adjacency),
+        sparse_adjacency,
+        transpose_adjacency,
+    )
+    sparse_adjacency = np.where(
+        np.abs(sparse_adjacency) >= np.abs(sparse_adjacency.T),
+        sparse_adjacency,
+        sparse_adjacency.T,
+    )
+    np.fill_diagonal(sparse_adjacency, 0.0)
+    return sparse_adjacency.astype(np.float32)
+
+
+def sparsify_adjacency_batch(adjacency_batch: np.ndarray, top_k: int = 0) -> np.ndarray:
+    adjacency_batch = np.asarray(adjacency_batch, dtype=np.float32)
+    top_k = int(top_k)
+    if top_k <= 0:
+        return adjacency_batch.copy()
+
+    sparse_batch = np.stack(
+        [sparsify_adjacency_matrix(adjacency, top_k=top_k) for adjacency in adjacency_batch],
+        axis=0,
+    )
+    return sparse_batch.astype(np.float32)
+
+
 def compute_dynamic_fc(subject_timeseries: np.ndarray, window_size: int = 50, stride: int = 25):
     """Compute sliding-window FC for a single subject."""
     subject_timeseries = np.asarray(subject_timeseries, dtype=float)
@@ -298,7 +364,8 @@ def train_graph_transformer(
         T_max=max(1, int(config["epochs"])),
         eta_min=1e-6,
     )
-    criterion = nn.CrossEntropyLoss()
+    class_weights = compute_class_weight_tensor(train_labels) if config["use_class_weights"] else torch.ones(2, dtype=torch.float32)
+    criterion = nn.CrossEntropyLoss(weight=class_weights.to(DEVICE))
 
     train_loader = build_graph_dataloader(train_nodes, train_adj, train_labels, config["batch_size"], shuffle=True)
     val_loader = build_graph_dataloader(val_nodes, val_adj, val_labels, config["batch_size"], shuffle=False)
@@ -371,6 +438,7 @@ def train_graph_transformer(
         "epochs_trained": len(history),
         "best_epoch": int(best_epoch),
         "best_validation_loss": float(best_val_loss),
+        "class_weights": [float(value) for value in class_weights.tolist()],
         "history": history,
     }
     return model, training_summary
@@ -394,6 +462,7 @@ def evaluate_graph_transformer(model, nodes, adjacency, labels):
     predicted_labels = np.concatenate(predicted_labels)
     true_labels = np.concatenate(true_labels)
     metrics = compute_binary_metrics(true_labels, predicted_labels)
+    metrics["balanced_accuracy"] = compute_balanced_accuracy(metrics)
     return metrics, true_labels, predicted_labels
 
 
@@ -428,6 +497,8 @@ def run_dfc_graph_transformer(args):
         "epochs": int(args.epochs),
         "patience": int(args.patience),
         "min_delta": float(args.min_delta),
+        "use_class_weights": bool(args.use_class_weights),
+        "adjacency_top_k": int(args.adjacency_top_k),
     }
 
     set_random_seed(DEFAULT_SEED)
@@ -464,6 +535,9 @@ def run_dfc_graph_transformer(args):
         train_nodes = scaler.transform(train_nodes.reshape(-1, n_node_features)).reshape(train_nodes.shape)
         val_nodes = scaler.transform(val_nodes.reshape(-1, n_node_features)).reshape(val_nodes.shape)
         test_nodes = scaler.transform(test_nodes.reshape(-1, n_node_features)).reshape(test_nodes.shape)
+        train_adj = sparsify_adjacency_batch(train_adj, top_k=model_config["adjacency_top_k"])
+        val_adj = sparsify_adjacency_batch(val_adj, top_k=model_config["adjacency_top_k"])
+        test_adj = sparsify_adjacency_batch(test_adj, top_k=model_config["adjacency_top_k"])
 
         model, training_summary = train_graph_transformer(
             train_nodes,
@@ -491,11 +565,13 @@ def run_dfc_graph_transformer(args):
         )
         print(
             f"Fold {fold_id}: accuracy={metrics['accuracy']:.4f}, "
+            f"balanced_accuracy={metrics['balanced_accuracy']:.4f}, "
             f"f1={metrics['f1']:.4f}, sensitivity={metrics['sensitivity']:.4f}, "
             f"specificity={metrics['specificity']:.4f}"
         )
 
     accuracies = [fold["metrics"]["accuracy"] for fold in fold_results]
+    balanced_accuracies = [fold["metrics"]["balanced_accuracy"] for fold in fold_results]
     f1s = [fold["metrics"]["f1"] for fold in fold_results]
     summary = {
         "pipeline": pipeline,
@@ -507,6 +583,8 @@ def run_dfc_graph_transformer(args):
         "metrics": {
             "accuracy_mean": float(np.mean(accuracies)),
             "accuracy_std": float(np.std(accuracies)),
+            "balanced_accuracy_mean": float(np.mean(balanced_accuracies)),
+            "balanced_accuracy_std": float(np.std(balanced_accuracies)),
             "f1_mean": float(np.mean(f1s)),
             "f1_std": float(np.std(f1s)),
         },
@@ -523,11 +601,19 @@ def run_dfc_graph_transformer(args):
     print("DYNAMIC FC + GRAPH TRANSFORMER RESULTS")
     print(f"Atlas: {args.roi_atlas}, Pipeline: {pipeline}")
     print(f"Window: {args.window_size}, Stride: {args.stride}")
-    print(f"Model: d_model={args.d_model}, heads={args.n_heads}, layers={args.n_layers}, dropout={args.dropout}")
+    print(
+        f"Model: d_model={args.d_model}, heads={args.n_heads}, layers={args.n_layers}, "
+        f"dropout={args.dropout}, class_weights={args.use_class_weights}, adjacency_top_k={args.adjacency_top_k}"
+    )
     print(f"{'=' * 60}")
     print(f"Accuracy: {summary['metrics']['accuracy_mean'] * 100:.2f}% ± {summary['metrics']['accuracy_std'] * 100:.2f}%")
+    print(
+        f"Balanced Accuracy: {summary['metrics']['balanced_accuracy_mean'] * 100:.2f}% "
+        f"± {summary['metrics']['balanced_accuracy_std'] * 100:.2f}%"
+    )
     print(f"F1:       {summary['metrics']['f1_mean']:.4f} ± {summary['metrics']['f1_std']:.4f}")
     print(f"Per-fold accuracies: {[f'{accuracy * 100:.1f}%' for accuracy in accuracies]}")
+    print(f"Per-fold balanced accuracies: {[f'{balanced_accuracy * 100:.1f}%' for balanced_accuracy in balanced_accuracies]}")
     print(f"Per-fold F1s:        {[f'{f1:.4f}' for f1 in f1s]}")
     print(f"Saved summary to {summary_path}")
     print(f"Seed is {DEFAULT_SEED}")
@@ -553,6 +639,18 @@ def build_arg_parser():
     parser.add_argument("--epochs", type=int, default=200, help="Maximum epochs")
     parser.add_argument("--patience", type=int, default=20, help="Early stopping patience")
     parser.add_argument("--min_delta", type=float, default=1e-4, help="Minimum validation improvement")
+    parser.add_argument(
+        "--use_class_weights",
+        type=lambda x: str(x).lower() == "true",
+        default=True,
+        help="Use fold-local balanced class weights in the cross-entropy loss.",
+    )
+    parser.add_argument(
+        "--adjacency_top_k",
+        type=int,
+        default=20,
+        help="Keep only the top-k strongest neighbors per ROI when building the graph adjacency. Use 0 for dense graphs.",
+    )
     parser.add_argument("--artifact_root", default="artifacts/dfc_graph_transformer", help="Directory for experiment artifacts")
     parser.add_argument("--verbose", type=lambda x: str(x).lower() == "true", default=True)
     return parser

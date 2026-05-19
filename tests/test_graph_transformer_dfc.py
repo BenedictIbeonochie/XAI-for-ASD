@@ -6,8 +6,11 @@ import torch
 from graph_transformer_dfc import (
     ASDGraphTransformer,
     build_dfc_node_features,
+    compute_class_weight_tensor,
     compute_dynamic_fc,
     evaluate_graph_transformer,
+    sparsify_adjacency_batch,
+    sparsify_adjacency_matrix,
     train_graph_transformer,
 )
 
@@ -62,6 +65,34 @@ class GraphTransformerDFCTests(unittest.TestCase):
 
         self.assertEqual(tuple(outputs.shape), (3, 2))
 
+    def test_compute_class_weight_tensor_upweights_minority_class(self):
+        weights = compute_class_weight_tensor(np.array([0, 0, 0, 1], dtype=int))
+
+        self.assertEqual(tuple(weights.shape), (2,))
+        self.assertGreater(float(weights[1]), float(weights[0]))
+
+    def test_sparsify_adjacency_matrix_keeps_only_top_k_neighbors(self):
+        adjacency = np.array(
+            [
+                [0.0, 0.9, 0.1, 0.2],
+                [0.9, 0.0, 0.8, 0.3],
+                [0.1, 0.8, 0.0, 0.7],
+                [0.2, 0.3, 0.7, 0.0],
+            ],
+            dtype=np.float32,
+        )
+
+        sparse = sparsify_adjacency_matrix(adjacency, top_k=1)
+
+        self.assertEqual(sparse.shape, adjacency.shape)
+        self.assertTrue(np.allclose(sparse, sparse.T))
+        self.assertLess(np.count_nonzero(np.abs(sparse) > 0), np.count_nonzero(np.abs(adjacency) > 0))
+
+    def test_sparsify_adjacency_batch_preserves_batch_shape(self):
+        adjacency = np.stack([np.eye(4, dtype=np.float32), np.ones((4, 4), dtype=np.float32)], axis=0)
+        sparse_batch = sparsify_adjacency_batch(adjacency, top_k=1)
+        self.assertEqual(sparse_batch.shape, adjacency.shape)
+
     def test_train_and_evaluate_graph_transformer_smoke_test(self):
         data, labels = make_synthetic_roi_timeseries_dataset(num_samples=12, num_timepoints=30, num_rois=6)
         node_features, adjacency = build_dfc_node_features(data, window_size=10, stride=5)
@@ -88,6 +119,8 @@ class GraphTransformerDFCTests(unittest.TestCase):
             "epochs": 1,
             "patience": 1,
             "min_delta": 0.0,
+            "use_class_weights": True,
+            "adjacency_top_k": 2,
         }
 
         model, training_summary = train_graph_transformer(
@@ -103,9 +136,11 @@ class GraphTransformerDFCTests(unittest.TestCase):
         metrics, _, predictions = evaluate_graph_transformer(model, test_nodes, test_adj, test_labels)
 
         self.assertIn("accuracy", metrics)
+        self.assertIn("balanced_accuracy", metrics)
         self.assertIn("f1", metrics)
         self.assertEqual(len(predictions), len(test_labels))
         self.assertEqual(training_summary["epochs_trained"], 1)
+        self.assertEqual(len(training_summary["class_weights"]), 2)
 
 
 if __name__ == "__main__":
