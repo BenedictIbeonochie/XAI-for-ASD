@@ -263,10 +263,12 @@ class ASDGraphTransformer(nn.Module):
         d_ff: int = 128,
         dropout: float = 0.3,
         readout: str = "mean_max",
+        use_edge_features: bool = True,
         num_classes: int = 2,
     ):
         super().__init__()
         self.readout = str(readout).strip().lower()
+        self.use_edge_features = bool(use_edge_features)
 
         self.input_proj = nn.Sequential(
             nn.Linear(n_node_features, d_model),
@@ -276,7 +278,7 @@ class ASDGraphTransformer(nn.Module):
         )
         self.transformer_layers = nn.ModuleList(
             [
-                GraphTransformerLayer(d_model, n_heads, d_ff, dropout, use_edge_features=True)
+                GraphTransformerLayer(d_model, n_heads, d_ff, dropout, use_edge_features=self.use_edge_features)
                 for _ in range(int(n_layers))
             ]
         )
@@ -351,6 +353,7 @@ def train_graph_transformer(
         n_layers=config["n_layers"],
         d_ff=config["d_ff"],
         dropout=config["dropout"],
+        use_edge_features=config["use_edge_features"],
         num_classes=2,
     ).to(DEVICE)
 
@@ -498,6 +501,7 @@ def run_dfc_graph_transformer(args):
         "patience": int(args.patience),
         "min_delta": float(args.min_delta),
         "use_class_weights": bool(args.use_class_weights),
+        "use_edge_features": bool(args.use_edge_features),
         "adjacency_top_k": int(args.adjacency_top_k),
     }
 
@@ -603,7 +607,8 @@ def run_dfc_graph_transformer(args):
     print(f"Window: {args.window_size}, Stride: {args.stride}")
     print(
         f"Model: d_model={args.d_model}, heads={args.n_heads}, layers={args.n_layers}, "
-        f"dropout={args.dropout}, class_weights={args.use_class_weights}, adjacency_top_k={args.adjacency_top_k}"
+        f"dropout={args.dropout}, class_weights={args.use_class_weights}, "
+        f"edge_features={args.use_edge_features}, adjacency_top_k={args.adjacency_top_k}"
     )
     print(f"{'=' * 60}")
     print(f"Accuracy: {summary['metrics']['accuracy_mean'] * 100:.2f}% ± {summary['metrics']['accuracy_std'] * 100:.2f}%")
@@ -644,6 +649,12 @@ def build_arg_parser():
         type=lambda x: str(x).lower() == "true",
         default=True,
         help="Use fold-local balanced class weights in the cross-entropy loss.",
+    )
+    parser.add_argument(
+        "--use_edge_features",
+        type=lambda x: str(x).lower() == "true",
+        default=True,
+        help="Use the subject connectivity matrix as an edge-bias term inside graph attention.",
     )
     parser.add_argument(
         "--adjacency_top_k",

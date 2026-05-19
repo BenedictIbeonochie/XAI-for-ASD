@@ -120,6 +120,7 @@ class GraphTransformerDFCTests(unittest.TestCase):
             "patience": 1,
             "min_delta": 0.0,
             "use_class_weights": True,
+            "use_edge_features": True,
             "adjacency_top_k": 2,
         }
 
@@ -141,6 +142,54 @@ class GraphTransformerDFCTests(unittest.TestCase):
         self.assertEqual(len(predictions), len(test_labels))
         self.assertEqual(training_summary["epochs_trained"], 1)
         self.assertEqual(len(training_summary["class_weights"]), 2)
+
+    def test_train_and_evaluate_graph_transformer_without_edge_features(self):
+        data, labels = make_synthetic_roi_timeseries_dataset(num_samples=12, num_timepoints=30, num_rois=6)
+        node_features, adjacency = build_dfc_node_features(data, window_size=10, stride=5)
+
+        train_nodes = node_features[:8]
+        val_nodes = node_features[8:10]
+        test_nodes = node_features[10:]
+        train_adj = adjacency[:8]
+        val_adj = adjacency[8:10]
+        test_adj = adjacency[10:]
+        train_labels = labels[:8]
+        val_labels = labels[8:10]
+        test_labels = labels[10:]
+
+        config = {
+            "d_model": 16,
+            "n_heads": 2,
+            "n_layers": 1,
+            "d_ff": 16,
+            "dropout": 0.1,
+            "learning_rate": 1e-3,
+            "weight_decay": 1e-3,
+            "batch_size": 4,
+            "epochs": 1,
+            "patience": 1,
+            "min_delta": 0.0,
+            "use_class_weights": False,
+            "use_edge_features": False,
+            "adjacency_top_k": 0,
+        }
+
+        model, training_summary = train_graph_transformer(
+            train_nodes,
+            train_adj,
+            train_labels,
+            val_nodes,
+            val_adj,
+            val_labels,
+            config,
+            verbose=False,
+        )
+        metrics, _, predictions = evaluate_graph_transformer(model, test_nodes, test_adj, test_labels)
+
+        self.assertIn("accuracy", metrics)
+        self.assertIn("balanced_accuracy", metrics)
+        self.assertEqual(len(predictions), len(test_labels))
+        self.assertEqual(training_summary["epochs_trained"], 1)
 
 
 if __name__ == "__main__":
