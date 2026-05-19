@@ -8,6 +8,7 @@ from typing import Any
 import shap
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
@@ -39,6 +40,10 @@ import networkx as nx
 from functools import reduce
 from sklearn.metrics import jaccard_score
 from sklearn.metrics.pairwise import cosine_similarity
+try:
+  from torchvision import models as tv_models
+except ImportError:
+  tv_models = None
 
 try:
   from lime import lime_tabular
@@ -523,6 +528,10 @@ class ReanalysisConfig:
   hist_gradient_learning_rate: float = 0.1
   hist_gradient_max_depth: int | None = 3
   hist_gradient_max_iter: int = 200
+  transfer_pretrained: bool = True
+  transfer_freeze_backbone: bool = True
+  transfer_image_size: int = 128
+  transfer_dropout_rate: float = 0.2
   harmonization_method: str = "none"
   harmonization_covariates: tuple[str, ...] = DEFAULT_HARMONIZATION_COVARIATES
   enable_confound_regression: bool = False
@@ -791,12 +800,66 @@ def apply_feature_transform(transformer, *feature_sets):
   ]
 
 
+def infer_roi_count_from_lookup(roi_lookup):
+  roi_lookup = np.asarray(roi_lookup, dtype=int)
+  if roi_lookup.size == 0:
+    raise ValueError("roi_lookup must contain at least one ROI pair.")
+  return int(np.max(roi_lookup)) + 1
+
+
+def build_connectivity_matrix_tensor(features, roi_pairs, roi_count):
+  features = sanitize_feature_matrix(features)
+  roi_pairs = np.asarray(roi_pairs, dtype=int)
+  num_samples = features.shape[0]
+  matrix_tensor = np.zeros((num_samples, roi_count, roi_count), dtype=np.float32)
+
+  if roi_pairs.size:
+    row_indices = roi_pairs[:, 0]
+    col_indices = roi_pairs[:, 1]
+    matrix_tensor[:, row_indices, col_indices] = features
+    matrix_tensor[:, col_indices, row_indices] = features
+
+  return matrix_tensor
+
+
+def prepare_transfer_learning_images(features, roi_pairs, roi_count, image_size):
+  matrices = build_connectivity_matrix_tensor(features, roi_pairs, roi_count)
+  image_tensor = torch.tensor(matrices, dtype=torch.float32).unsqueeze(1)
+
+  min_values = image_tensor.amin(dim=(2, 3), keepdim=True)
+  max_values = image_tensor.amax(dim=(2, 3), keepdim=True)
+  denominators = torch.where((max_values - min_values) > 0, max_values - min_values, torch.ones_like(max_values))
+  image_tensor = (image_tensor - min_values) / denominators
+  image_tensor = image_tensor.repeat(1, 3, 1, 1)
+
+  image_size = max(32, int(image_size))
+  if image_tensor.shape[-1] != image_size or image_tensor.shape[-2] != image_size:
+    image_tensor = F.interpolate(image_tensor, size=(image_size, image_size), mode='bilinear', align_corners=False)
+
+  imagenet_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
+  imagenet_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
+  image_tensor = (image_tensor - imagenet_mean) / imagenet_std
+
+  return image_tensor
+
+
+def build_transfer_learning_dataloader(features, labels, roi_pairs, roi_count, image_size, batch_size, shuffle):
+  image_tensor = prepare_transfer_learning_images(features, roi_pairs, roi_count, image_size)
+  labels_tensor = torch.tensor(np.asarray(labels), dtype=torch.long)
+  dataset = TensorDataset(image_tensor, labels_tensor)
+  return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0)
+
+
 def normalize_model_type(model_type):
   return str(model_type).strip().lower()
 
 
 def normalize_selector_type(selector_type):
   return str(selector_type).strip().lower()
+
+
+def is_transfer_learning_model(model_type):
+  return normalize_model_type(model_type) in {'resnet18_transfer', 'efficientnet_b0_transfer'}
 
 
 def normalize_feature_transform(feature_transform):
@@ -1432,6 +1495,10 @@ def build_summary_row(summary, config_name=None, repeat_index=None):
     'model_type': config.model_type,
     'selector_type': config.selector_type,
     'rfecv_inner_splits': int(config.rfecv_inner_splits),
+    'transfer_pretrained': bool(config.transfer_pretrained),
+    'transfer_freeze_backbone': bool(config.transfer_freeze_backbone),
+    'transfer_image_size': int(config.transfer_image_size),
+    'transfer_dropout_rate': float(config.transfer_dropout_rate),
     'ssae_dropout_rate': float(config.ssae_dropout_rate),
     'harmonization_method': config.harmonization_method,
     'enable_confound_regression': bool(config.enable_confound_regression),
@@ -1715,6 +1782,28 @@ class StackedAutoencoder(nn.Module):
       x = self.dropout(x)
       x = self.classifier(x)
       return x
+
+
+class TransferLearningClassifier(nn.Module):
+  def __init__(self, backbone, feature_dim, dropout_rate=0.2, num_classes=2, freeze_backbone=False):
+    super(TransferLearningClassifier, self).__init__()
+    self.backbone = backbone
+    self.freeze_backbone = bool(freeze_backbone)
+    self.dropout = nn.Dropout(p=float(max(0.0, dropout_rate)))
+    self.classifier = nn.Linear(feature_dim, num_classes)
+
+  def train(self, mode=True):
+    super().train(mode)
+    if self.freeze_backbone:
+      self.backbone.eval()
+    return self
+
+  def forward(self, x):
+    features = self.backbone(x)
+    if features.ndim > 2:
+      features = torch.flatten(features, 1)
+    features = self.dropout(features)
+    return self.classifier(features)
   
 class CustomDataset(Dataset):
   def __init__(self, data, labels):
@@ -2289,6 +2378,109 @@ def model_predict_lime(model, data):
 
   return probabilities
 
+
+def build_transfer_learning_model(config):
+  if tv_models is None:
+    raise ImportError("torchvision is required for transfer learning backbones but is not installed.")
+
+  model_type = normalize_model_type(config.model_type)
+  pretrained_requested = bool(config.transfer_pretrained)
+  pretrained_loaded = False
+
+  def build_backbone(load_pretrained):
+    if model_type == 'resnet18_transfer':
+      weights = tv_models.ResNet18_Weights.DEFAULT if load_pretrained else None
+      backbone_model = tv_models.resnet18(weights=weights)
+      feature_size = int(backbone_model.fc.in_features)
+      backbone_model.fc = nn.Identity()
+      return backbone_model, feature_size
+    if model_type == 'efficientnet_b0_transfer':
+      weights = tv_models.EfficientNet_B0_Weights.DEFAULT if load_pretrained else None
+      backbone_model = tv_models.efficientnet_b0(weights=weights)
+      feature_size = int(backbone_model.classifier[1].in_features)
+      backbone_model.classifier = nn.Identity()
+      return backbone_model, feature_size
+    raise ValueError(
+      f"Unknown transfer learning model_type '{config.model_type}'. "
+      "Supported options: resnet18_transfer, efficientnet_b0_transfer."
+    )
+
+  try:
+    backbone, feature_dim = build_backbone(pretrained_requested)
+    pretrained_loaded = bool(pretrained_requested)
+  except Exception:
+    backbone, feature_dim = build_backbone(False)
+    pretrained_loaded = False
+
+  if config.transfer_freeze_backbone:
+    for parameter in backbone.parameters():
+      parameter.requires_grad = False
+
+  model = TransferLearningClassifier(
+    backbone=backbone,
+    feature_dim=feature_dim,
+    dropout_rate=config.transfer_dropout_rate,
+    num_classes=2,
+    freeze_backbone=config.transfer_freeze_backbone,
+  ).to(device)
+
+  return model, {
+    'pretrained_requested': bool(pretrained_requested),
+    'pretrained_loaded': bool(pretrained_loaded),
+    'freeze_backbone': bool(config.transfer_freeze_backbone),
+    'image_size': int(config.transfer_image_size),
+    'dropout_rate': float(config.transfer_dropout_rate),
+  }
+
+
+def train_transfer_learning_model(train_features, train_labels, validation_features, validation_labels, roi_pairs, roi_count, config, verbose=False):
+  train_dataloader = build_transfer_learning_dataloader(
+    train_features,
+    train_labels,
+    roi_pairs,
+    roi_count,
+    config.transfer_image_size,
+    config.batch_size,
+    shuffle=True,
+  )
+  validation_dataloader = build_transfer_learning_dataloader(
+    validation_features,
+    validation_labels,
+    roi_pairs,
+    roi_count,
+    config.transfer_image_size,
+    config.batch_size,
+    shuffle=False,
+  )
+
+  model, transfer_summary = build_transfer_learning_model(config)
+  optimizer = optim.Adam(
+    [parameter for parameter in model.parameters() if parameter.requires_grad],
+    lr=config.classifier_learning_rate,
+    weight_decay=config.weight_decay,
+  )
+  criterion = nn.CrossEntropyLoss()
+
+  training_summary = train_supervised_stage(
+    model,
+    train_dataloader,
+    validation_dataloader,
+    criterion,
+    optimizer,
+    config.classifier_epochs,
+    config.early_stopping_patience,
+    config.early_stopping_min_delta,
+    "Transfer",
+    scheduler_type=config.supervised_scheduler_type,
+    scheduler_patience=config.scheduler_patience,
+    scheduler_factor=config.scheduler_factor,
+    verbose=verbose,
+  )
+  training_summary['model_type'] = normalize_model_type(config.model_type)
+  training_summary['transfer_learning'] = transfer_summary
+
+  return model, training_summary
+
 def train_single_fold_model(train_dataloader, val_dataloader, input_size, config, verbose=False):
   ae1_hidden_size, ae2_hidden_size = resolve_hidden_layer_sizes(input_size, config)
 
@@ -2438,7 +2630,7 @@ def train_baseline_model(train_features, train_labels, validation_features, vali
   else:
     raise ValueError(
       f"Unknown model_type '{config.model_type}'. "
-      "Supported options: ssae, linear_svm, logistic_l1, logistic_elastic_net, hist_gradient_boosting."
+      "Supported options: ssae, linear_svm, logistic_l1, logistic_elastic_net, hist_gradient_boosting, resnet18_transfer, efficientnet_b0_transfer."
     )
 
   model.fit(train_features, train_labels)
@@ -2468,7 +2660,7 @@ def train_baseline_model(train_features, train_labels, validation_features, vali
   return model, training_summary
 
 
-def train_fold_model(train_features, train_labels, validation_features, validation_labels, config, verbose=False):
+def train_fold_model(train_features, train_labels, validation_features, validation_labels, config, verbose=False, selected_roi_pairs=None, roi_count=None):
   model_type = normalize_model_type(config.model_type)
 
   if model_type == 'ssae':
@@ -2478,6 +2670,20 @@ def train_fold_model(train_features, train_labels, validation_features, validati
       train_dataloader,
       validation_dataloader,
       input_size=train_features.shape[1],
+      config=config,
+      verbose=verbose,
+    )
+
+  if is_transfer_learning_model(model_type):
+    if selected_roi_pairs is None or roi_count is None:
+      raise ValueError("selected_roi_pairs and roi_count are required for transfer learning models.")
+    return train_transfer_learning_model(
+      train_features,
+      train_labels,
+      validation_features,
+      validation_labels,
+      selected_roi_pairs,
+      roi_count,
       config=config,
       verbose=verbose,
     )
@@ -2603,9 +2809,22 @@ def select_feature_count_for_fold(feature_vectors, labels_from_abide, roi_lookup
       candidate_validation_labels,
       config=config,
       verbose=False,
+      selected_roi_pairs=candidate_selection.selected_roi_pairs,
+      roi_count=infer_roi_count_from_lookup(roi_lookup),
     )
     if normalize_model_type(config.model_type) == 'ssae':
       candidate_validation_loader = build_dataloader(candidate_validation_features, candidate_validation_labels, config.batch_size, shuffle=False)
+      candidate_metrics, _, _ = evaluate_torch_model(candidate_model, candidate_validation_loader)
+    elif is_transfer_learning_model(config.model_type):
+      candidate_validation_loader = build_transfer_learning_dataloader(
+        candidate_validation_features,
+        candidate_validation_labels,
+        candidate_selection.selected_roi_pairs,
+        infer_roi_count_from_lookup(roi_lookup),
+        config.transfer_image_size,
+        config.batch_size,
+        shuffle=False,
+      )
       candidate_metrics, _, _ = evaluate_torch_model(candidate_model, candidate_validation_loader)
     else:
       candidate_metrics, _, _ = evaluate_sklearn_model(candidate_model, candidate_validation_features, candidate_validation_labels)
@@ -2896,6 +3115,7 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
 
   labels_from_abide = np.asarray(labels_from_abide, dtype=int)
   roi_lookup = prepare_feature_index_lookup(feature_indices)
+  roi_count = infer_roi_count_from_lookup(roi_lookup)
   if subject_metadata is not None:
     subject_metadata = prepare_subject_metadata(subject_metadata)
 
@@ -2910,6 +3130,11 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
     raise ValueError(
       f"feature_representation '{config.feature_representation}' must receive raw_data so it can be fit inside each fold."
     )
+  if is_transfer_learning_model(config.model_type):
+    if normalize_feature_transform(config.feature_transform) not in {'', 'none'}:
+      raise ValueError("Transfer learning models require feature_transform='none' so ROI-pair structure is preserved.")
+    if not is_edge_level_feature_representation(feature_representation):
+      raise ValueError("Transfer learning models require an edge-level feature representation.")
   if str(config.harmonization_method).strip().lower() not in {'', 'none'} and config.enable_confound_regression:
     raise ValueError("Use either ComBat harmonization or confound regression, not both in the same run.")
 
@@ -3034,12 +3259,34 @@ def train_and_eval_model(feature_vectors, labels_from_abide, pipeline='unknown',
       validation_labels,
       config=config,
       verbose=verbose,
+      selected_roi_pairs=selection.selected_roi_pairs,
+      roi_count=roi_count,
     )
     train_dataloader = None
     test_dataloader = None
     if normalize_model_type(config.model_type) == 'ssae':
       train_dataloader = build_dataloader(train_features, train_labels, config.batch_size, shuffle=True)
       test_dataloader = build_dataloader(test_features, test_labels, config.batch_size, shuffle=False)
+      metrics, true_labels, predicted_labels = evaluate_torch_model(model, test_dataloader)
+    elif is_transfer_learning_model(config.model_type):
+      train_dataloader = build_transfer_learning_dataloader(
+        train_features,
+        train_labels,
+        selection.selected_roi_pairs,
+        roi_count,
+        config.transfer_image_size,
+        config.batch_size,
+        shuffle=True,
+      )
+      test_dataloader = build_transfer_learning_dataloader(
+        test_features,
+        test_labels,
+        selection.selected_roi_pairs,
+        roi_count,
+        config.transfer_image_size,
+        config.batch_size,
+        shuffle=False,
+      )
       metrics, true_labels, predicted_labels = evaluate_torch_model(model, test_dataloader)
     else:
       metrics, true_labels, predicted_labels = evaluate_sklearn_model(model, test_features, test_labels)
@@ -3332,6 +3579,10 @@ def parse_reanalysis_log(log_path):
     'model_type',
     'selector_type',
     'rfecv_inner_splits',
+    'transfer_pretrained',
+    'transfer_freeze_backbone',
+    'transfer_image_size',
+    'transfer_dropout_rate',
     'ssae_dropout_rate',
     'harmonization_method',
     'enable_confound_regression',
@@ -3722,7 +3973,7 @@ if __name__ == "__main__":
   parser.add_argument('--feature_transform', default='none', help='Optional fold-local transform applied after selection and scaling. Options: none, pca')
   parser.add_argument('--pca_components', type=int, default=0, help='Number of PCA components when --feature_transform pca. Use 0 to keep the full rank allowed by the training fold.')
   parser.add_argument('--selector_type', default='rfe', help='Feature selector to use inside each fold. Options: rfe, rfecv, anova_f, mutual_info, logistic_l1, mrmr, none')
-  parser.add_argument('--model_type', default='ssae', help='Model to train on the selected features. Options: ssae, linear_svm, logistic_l1, logistic_elastic_net, hist_gradient_boosting')
+  parser.add_argument('--model_type', default='ssae', help='Model to train on the selected features. Options: ssae, linear_svm, logistic_l1, logistic_elastic_net, hist_gradient_boosting, resnet18_transfer, efficientnet_b0_transfer')
   parser.add_argument('--ae1_hidden_size', type=int, default=500, help='Hidden size for the first autoencoder layer.')
   parser.add_argument('--ae2_hidden_size', type=int, default=100, help='Hidden size for the second autoencoder layer.')
   parser.add_argument('--ssae_dropout_rate', type=float, default=0.0, help='Dropout rate applied between SSAE encoder layers during supervised classification and fine-tuning.')
@@ -3752,6 +4003,10 @@ if __name__ == "__main__":
   parser.add_argument('--hist_gradient_learning_rate', type=float, default=0.1, help='Learning rate for the histogram gradient boosting baseline.')
   parser.add_argument('--hist_gradient_max_depth', type=int, default=3, help='Maximum tree depth for the histogram gradient boosting baseline.')
   parser.add_argument('--hist_gradient_max_iter', type=int, default=200, help='Maximum number of boosting iterations for the histogram gradient boosting baseline.')
+  parser.add_argument('--transfer_pretrained', type=lambda x: (str(x).lower() == 'true'), default=True, help='Load ImageNet-pretrained weights for transfer learning backbones when available.')
+  parser.add_argument('--transfer_freeze_backbone', type=lambda x: (str(x).lower() == 'true'), default=True, help='Freeze the transfer-learning backbone and train only the classifier head.')
+  parser.add_argument('--transfer_image_size', type=int, default=128, help='Square image size used when converting connectivity matrices for transfer learning backbones.')
+  parser.add_argument('--transfer_dropout_rate', type=float, default=0.2, help='Dropout applied before the transfer-learning classifier head.')
   parser.add_argument('--harmonization_method', default='none', help='Optional leak-free harmonization stage fit on the training fold only. Options: none, combat')
   parser.add_argument('--harmonization_covariates', nargs='*', default=list(DEFAULT_HARMONIZATION_COVARIATES), help='Covariates to preserve during harmonization. Options: age, sex')
   parser.add_argument('--use_feature_scaling', type=lambda x: (str(x).lower() == 'true'), default=True, help='Scale selected features inside each fold using training data only.')
@@ -3801,6 +4056,10 @@ if __name__ == "__main__":
   print("model_type: ", args.model_type)
   print("selector_type: ", args.selector_type)
   print("rfecv_inner_splits: ", args.rfecv_inner_splits)
+  print("transfer_pretrained: ", args.transfer_pretrained)
+  print("transfer_freeze_backbone: ", args.transfer_freeze_backbone)
+  print("transfer_image_size: ", args.transfer_image_size)
+  print("transfer_dropout_rate: ", args.transfer_dropout_rate)
   print("ssae_dropout_rate: ", args.ssae_dropout_rate)
   print("harmonization_method: ", args.harmonization_method)
   print("enable_confound_regression: ", args.enable_confound_regression)
@@ -3870,6 +4129,10 @@ if __name__ == "__main__":
     hist_gradient_learning_rate=args.hist_gradient_learning_rate,
     hist_gradient_max_depth=args.hist_gradient_max_depth,
     hist_gradient_max_iter=args.hist_gradient_max_iter,
+    transfer_pretrained=args.transfer_pretrained,
+    transfer_freeze_backbone=args.transfer_freeze_backbone,
+    transfer_image_size=args.transfer_image_size,
+    transfer_dropout_rate=args.transfer_dropout_rate,
     harmonization_method=args.harmonization_method,
     harmonization_covariates=tuple(args.harmonization_covariates or ()),
     enable_confound_regression=args.enable_confound_regression,
