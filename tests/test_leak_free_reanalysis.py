@@ -23,6 +23,7 @@ from app.main import (
     collect_reanalysis_logs,
     coerce_explanation_ranking,
     compute_fold_explanations,
+    get_data_from_abide,
     get_feature_vecs,
     get_top_features_from_selector,
     get_top_features_from_SVM_RFE,
@@ -120,6 +121,34 @@ class LeakFreeReanalysisTests(unittest.TestCase):
         self.assertEqual(selection.selected_feature_indices.shape, (5,))
         self.assertEqual(selection.selected_roi_pairs.shape, (5, 2))
         np.testing.assert_array_equal(selection.training_sample_indices, train_indices)
+
+    def test_get_data_from_abide_supports_site_filters(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            downloads_dir = Path(tmpdir)
+            np.savetxt(downloads_dir / "subject_a_rois_aal.1D", np.ones((4, 3), dtype=float))
+            np.savetxt(downloads_dir / "subject_b_rois_aal.1D", np.full((4, 3), 2.0, dtype=float))
+
+            phenotype = pd.DataFrame(
+                [
+                    {"FILE_ID": "subject_a", "DX_GROUP": 1, "SITE_ID": "NYU", "AGE_AT_SCAN": 10.0, "SEX": 1.0},
+                    {"FILE_ID": "subject_b", "DX_GROUP": 2, "SITE_ID": "UCLA_1", "AGE_AT_SCAN": 12.0, "SEX": 2.0},
+                ]
+            ).set_index("FILE_ID", drop=False)
+
+            with patch("app.main.resolve_abide_download_dir", return_value=downloads_dir), patch(
+                "app.main.load_phenotype_table",
+                return_value=phenotype,
+            ):
+                data, labels, subject_metadata = get_data_from_abide(
+                    "dparsf",
+                    roi_atlas="rois_aal_fd02",
+                    site_filters=("NYU",),
+                    return_subject_metadata=True,
+                )
+
+            self.assertEqual(len(data), 1)
+            self.assertEqual(labels.tolist(), [0.0])
+            self.assertEqual(subject_metadata["site_id"].tolist(), ["NYU"])
 
     def test_none_selector_returns_all_features_without_filtering(self):
         feature_vectors, labels, feature_indices = make_synthetic_feature_matrix(num_features=7)

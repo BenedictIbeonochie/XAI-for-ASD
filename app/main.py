@@ -100,6 +100,20 @@ def load_phenotype_table(pheno_file='data/Phenotypic_V1_0b_preprocessed1.csv'):
   phenotype = phenotype.loc[phenotype['FILE_ID'] != ''].drop_duplicates(subset='FILE_ID', keep='first')
   return phenotype.set_index('FILE_ID', drop=False)
 
+
+def normalize_site_filters(site_filters):
+  if not site_filters:
+    return tuple()
+
+  normalized_filters = []
+  for site_filter in site_filters:
+    value = str(site_filter or '').strip()
+    if not value:
+      continue
+    normalized_filters.append(value)
+
+  return dedupe_preserve_order(normalized_filters)
+
 def normalize_output_segment(value, default, field_name):
   normalized_value = str(value or default).strip()
   if not normalized_value:
@@ -158,6 +172,7 @@ def get_data_from_abide(
   pipeline,
   preprocessing_condition=DEFAULT_PREPROCESSING_CONDITION,
   roi_atlas=DEFAULT_ROI_ATLAS,
+  site_filters=None,
   return_subject_metadata=False,
 ):
   downloads = resolve_abide_download_dir(
@@ -168,6 +183,8 @@ def get_data_from_abide(
   pheno_file = 'data/Phenotypic_V1_0b_preprocessed1.csv'
 
   phenotype = load_phenotype_table(pheno_file)
+  site_filters = normalize_site_filters(site_filters)
+  allowed_sites = set(site_filters)
 
   data = []
   labels = []
@@ -177,22 +194,40 @@ def get_data_from_abide(
     if filename.endswith('.1D'):  # Check if the file is a .1D file
       filepath = downloads / filename
       dataset = np.loadtxt(filepath)  # Load the file
-      data.append(dataset)  # Append the dataset to the list
 
       file_id = '_'.join(filename.split('_')[:-2]) # Get file ID from filename
       if file_id not in phenotype.index:
         raise KeyError(file_id)
 
       row = phenotype.loc[file_id]
+      site_id = str(row.get('SITE_ID', '')).strip()
+      if allowed_sites and site_id not in allowed_sites:
+        continue
+
+      data.append(dataset)  # Append the dataset only after any site filter passes
       labels.append(float(row['DX_GROUP']))
       subject_metadata.append({
         'file_id': file_id,
-        'site_id': str(row.get('SITE_ID', '')).strip(),
+        'site_id': site_id,
         'age_at_scan': parse_optional_float(row.get('AGE_AT_SCAN')),
         'sex': parse_optional_float(row.get('SEX')),
       })
 
   labels = np.array(labels) - 1
+
+  if site_filters and len(labels) == 0:
+    available_sites = sorted(
+      {
+        str(phenotype.loc['_'.join(filename.split('_')[:-2])].get('SITE_ID', '')).strip()
+        for filename in os.listdir(downloads)
+        if filename.endswith('.1D') and '_'.join(filename.split('_')[:-2]) in phenotype.index
+      }
+    )
+    raise ValueError(
+      f"No subjects matched site_filters={list(site_filters)} for pipeline='{pipeline}', "
+      f"preprocessing_condition='{preprocessing_condition}', roi_atlas='{roi_atlas}'. "
+      f"Available sites in this directory: {available_sites or 'none found'}."
+    )
 
   if return_subject_metadata:
     return data, labels, pd.DataFrame(subject_metadata)
@@ -500,6 +535,7 @@ class ReanalysisConfig:
   pca_components: int = 0
   preprocessing_condition: str = DEFAULT_PREPROCESSING_CONDITION
   roi_atlas: str = DEFAULT_ROI_ATLAS
+  site_filters: tuple[str, ...] = ()
   feature_count_candidates: tuple[int, ...] = ()
   feature_count_selection_metric: str = "f1"
   selector_type: str = "rfe"
@@ -1541,6 +1577,7 @@ def build_summary_row(summary, config_name=None, repeat_index=None):
     'pipeline': summary.pipeline,
     'preprocessing_condition': config.preprocessing_condition,
     'roi_atlas': config.roi_atlas,
+    'site_filters': '|'.join(config.site_filters),
     'feature_representation': config.feature_representation,
     'feature_transform': config.feature_transform,
     'pca_components': int(config.pca_components),
@@ -3961,6 +3998,7 @@ def run_pipeline_reanalysis(pipeline, verbose=False, config=None):
     pipeline,
     preprocessing_condition=config.preprocessing_condition,
     roi_atlas=config.roi_atlas,
+    site_filters=config.site_filters,
     return_subject_metadata=True,
   )
   feature_representation = normalize_feature_representation(config.feature_representation)
@@ -4271,6 +4309,7 @@ if __name__ == "__main__":
   parser.add_argument('--artifact_root', default='artifacts/reanalysis', help='Directory for corrected reanalysis artifacts.')
   parser.add_argument('--preprocessing_condition', default=DEFAULT_PREPROCESSING_CONDITION, help='ABIDE preprocessing condition directory to load, e.g. filt_global, filt_noglobal, nofilt_global, nofilt_noglobal')
   parser.add_argument('--roi_atlas', default=DEFAULT_ROI_ATLAS, help='ROI atlas directory to load, e.g. rois_aal, rois_cc200, rois_cc400, rois_ho, rois_dosenbach160, rois_ez, rois_tt')
+  parser.add_argument('--site_filters', nargs='*', default=(), help='Optional ABIDE site IDs to keep, e.g. --site_filters NYU UCLA_1. When omitted, all available sites are used.')
   parser.add_argument('--num_selected_features', type=int, default=1000, help='Number of fold-local features to keep when an explicit selector is used. Ignored when --selector_type none.')
   parser.add_argument('--feature_representation', default=DEFAULT_FEATURE_REPRESENTATION, help='Connectivity representation to build before fold-local selection. Options: edge_vector, graph_summary, tangent_vector, partial_correlation_vector')
   parser.add_argument('--feature_transform', default='none', help='Optional fold-local transform applied after selection and scaling. Options: none, pca')
@@ -4359,6 +4398,7 @@ if __name__ == "__main__":
   print("collect_results_from_logs: ", collect_results_from_logs_flag)
   print("preprocessing_condition: ", args.preprocessing_condition)
   print("roi_atlas: ", args.roi_atlas)
+  print("site_filters: ", list(args.site_filters or ()))
   print("feature_representation: ", args.feature_representation)
   print("feature_transform: ", args.feature_transform)
   print("pca_components: ", args.pca_components)
@@ -4411,6 +4451,7 @@ if __name__ == "__main__":
     artifact_root=args.artifact_root,
     preprocessing_condition=args.preprocessing_condition,
     roi_atlas=args.roi_atlas,
+    site_filters=normalize_site_filters(args.site_filters),
     num_selected_features=args.num_selected_features,
     feature_representation=args.feature_representation,
     feature_transform=args.feature_transform,
