@@ -387,6 +387,65 @@ class LeakFreeReanalysisTests(unittest.TestCase):
         self.assertEqual(summary.fold_results[0].training_summary['model_type'], 'connectivity_cnn')
         self.assertEqual(summary.fold_results[0].training_summary['transfer_learning']['input_channels'], 1)
 
+    def test_train_and_eval_model_supports_brainnet_cnn(self):
+        feature_vectors, labels, feature_indices = make_synthetic_feature_matrix(num_samples=18, num_features=6)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.make_fast_config(
+                temp_dir,
+                n_splits=3,
+                model_type='brainnet_cnn',
+                selector_type='none',
+                feature_transform='none',
+                classifier_epochs=1,
+                transfer_image_size=32,
+                brainnet_base_channels=8,
+            )
+            summary = train_and_eval_model(
+                feature_vectors,
+                labels,
+                pipeline='synthetic',
+                feature_indices=feature_indices,
+                verbose=False,
+                config=config,
+            )
+
+        self.assertEqual(len(summary.fold_results), 3)
+        self.assertEqual(summary.fold_results[0].training_summary['model_type'], 'brainnet_cnn')
+        self.assertEqual(summary.fold_results[0].training_summary['transfer_learning']['architecture'], 'brainnet_cnn')
+
+    def test_train_and_eval_model_supports_connectivity_vit_fusion(self):
+        feature_vectors, labels, feature_indices = make_synthetic_feature_matrix(num_samples=18, num_features=6)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.make_fast_config(
+                temp_dir,
+                n_splits=3,
+                model_type='connectivity_vit_fusion',
+                selector_type='none',
+                feature_transform='none',
+                classifier_epochs=1,
+                transfer_image_size=32,
+                brainnet_base_channels=8,
+                vit_patch_size=8,
+                vit_embedding_dim=32,
+                vit_num_heads=4,
+                vit_num_layers=1,
+                vit_mlp_dim=64,
+            )
+            summary = train_and_eval_model(
+                feature_vectors,
+                labels,
+                pipeline='synthetic',
+                feature_indices=feature_indices,
+                verbose=False,
+                config=config,
+            )
+
+        self.assertEqual(len(summary.fold_results), 3)
+        self.assertEqual(summary.fold_results[0].training_summary['model_type'], 'connectivity_vit_fusion')
+        self.assertEqual(summary.fold_results[0].training_summary['transfer_learning']['architecture'], 'connectivity_vit_fusion')
+
     def test_train_and_eval_model_applies_pca_inside_each_fold(self):
         feature_vectors, labels, feature_indices = make_synthetic_feature_matrix(num_samples=30, num_features=8)
 

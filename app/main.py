@@ -532,6 +532,12 @@ class ReanalysisConfig:
   transfer_freeze_backbone: bool = True
   transfer_image_size: int = 128
   transfer_dropout_rate: float = 0.2
+  brainnet_base_channels: int = 16
+  vit_patch_size: int = 16
+  vit_embedding_dim: int = 64
+  vit_num_heads: int = 4
+  vit_num_layers: int = 2
+  vit_mlp_dim: int = 128
   harmonization_method: str = "none"
   harmonization_covariates: tuple[str, ...] = DEFAULT_HARMONIZATION_COVARIATES
   enable_confound_regression: bool = False
@@ -899,7 +905,13 @@ def is_transfer_learning_model(model_type):
 
 
 def is_connectivity_image_model(model_type):
-  return normalize_model_type(model_type) in {'resnet18_transfer', 'efficientnet_b0_transfer', 'connectivity_cnn'}
+  return normalize_model_type(model_type) in {
+    'resnet18_transfer',
+    'efficientnet_b0_transfer',
+    'connectivity_cnn',
+    'brainnet_cnn',
+    'connectivity_vit_fusion',
+  }
 
 
 def normalize_feature_transform(feature_transform):
@@ -1539,6 +1551,12 @@ def build_summary_row(summary, config_name=None, repeat_index=None):
     'transfer_freeze_backbone': bool(config.transfer_freeze_backbone),
     'transfer_image_size': int(config.transfer_image_size),
     'transfer_dropout_rate': float(config.transfer_dropout_rate),
+    'brainnet_base_channels': int(config.brainnet_base_channels),
+    'vit_patch_size': int(config.vit_patch_size),
+    'vit_embedding_dim': int(config.vit_embedding_dim),
+    'vit_num_heads': int(config.vit_num_heads),
+    'vit_num_layers': int(config.vit_num_layers),
+    'vit_mlp_dim': int(config.vit_mlp_dim),
     'ssae_dropout_rate': float(config.ssae_dropout_rate),
     'harmonization_method': config.harmonization_method,
     'enable_confound_regression': bool(config.enable_confound_regression),
@@ -1871,6 +1889,126 @@ class ConnectivityCNNClassifier(nn.Module):
     features = torch.flatten(features, 1)
     features = self.dropout(features)
     return self.classifier(features)
+
+
+class BrainNetEdgeToEdgeBlock(nn.Module):
+  def __init__(self, input_channels, output_channels):
+    super(BrainNetEdgeToEdgeBlock, self).__init__()
+    self.row_conv = nn.Conv2d(input_channels, output_channels, kernel_size=(1, 3), padding=(0, 1), bias=False)
+    self.col_conv = nn.Conv2d(input_channels, output_channels, kernel_size=(3, 1), padding=(1, 0), bias=False)
+    self.norm = nn.BatchNorm2d(output_channels)
+    self.activation = nn.ReLU(inplace=True)
+
+  def forward(self, x):
+    edge_features = self.row_conv(x) + self.col_conv(x)
+    return self.activation(self.norm(edge_features))
+
+
+class BrainNetCNNClassifier(nn.Module):
+  def __init__(self, dropout_rate=0.3, num_classes=2, base_channels=16, pooled_nodes=32):
+    super(BrainNetCNNClassifier, self).__init__()
+    pooled_nodes = max(8, int(pooled_nodes))
+    self.edge_layers = nn.Sequential(
+      BrainNetEdgeToEdgeBlock(1, base_channels),
+      BrainNetEdgeToEdgeBlock(base_channels, base_channels * 2),
+      nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size=1, bias=False),
+      nn.BatchNorm2d(base_channels * 4),
+      nn.ReLU(inplace=True),
+    )
+    self.row_pool = nn.AdaptiveAvgPool1d(pooled_nodes)
+    self.col_pool = nn.AdaptiveAvgPool1d(pooled_nodes)
+    fusion_dim = (base_channels * 4 * pooled_nodes * 2) + (base_channels * 4)
+    self.dropout = nn.Dropout(p=float(max(0.0, dropout_rate)))
+    self.classifier = nn.Sequential(
+      nn.Linear(fusion_dim, base_channels * 8),
+      nn.ReLU(inplace=True),
+      nn.Dropout(p=float(max(0.0, dropout_rate))),
+      nn.Linear(base_channels * 8, num_classes),
+    )
+
+  def forward(self, x):
+    edge_features = self.edge_layers(x)
+    pooled_global = F.adaptive_avg_pool2d(edge_features, output_size=(1, 1)).flatten(1)
+    pooled_rows = self.row_pool(edge_features.mean(dim=3)).flatten(1)
+    pooled_cols = self.col_pool(edge_features.mean(dim=2)).flatten(1)
+    fused_features = torch.cat([pooled_global, pooled_rows, pooled_cols], dim=1)
+    fused_features = self.dropout(fused_features)
+    return self.classifier(fused_features)
+
+
+class ConnectivityViTFusionClassifier(nn.Module):
+  def __init__(
+    self,
+    image_size=128,
+    patch_size=16,
+    embedding_dim=64,
+    num_heads=4,
+    num_layers=2,
+    mlp_dim=128,
+    dropout_rate=0.3,
+    num_classes=2,
+    cnn_base_channels=16,
+  ):
+    super(ConnectivityViTFusionClassifier, self).__init__()
+    image_size = int(image_size)
+    patch_size = int(patch_size)
+    if image_size < patch_size or image_size % patch_size != 0:
+      raise ValueError(
+        f"transfer_image_size={image_size} must be divisible by vit_patch_size={patch_size} for connectivity_vit_fusion."
+      )
+
+    self.cnn_branch = nn.Sequential(
+      nn.Conv2d(1, cnn_base_channels, kernel_size=3, padding=1, bias=False),
+      nn.BatchNorm2d(cnn_base_channels),
+      nn.ReLU(inplace=True),
+      nn.MaxPool2d(kernel_size=2),
+      nn.Conv2d(cnn_base_channels, cnn_base_channels * 2, kernel_size=3, padding=1, bias=False),
+      nn.BatchNorm2d(cnn_base_channels * 2),
+      nn.ReLU(inplace=True),
+      nn.AdaptiveAvgPool2d((1, 1)),
+    )
+    self.cnn_projection = nn.Linear(cnn_base_channels * 2, embedding_dim)
+
+    self.patch_embed = nn.Conv2d(1, embedding_dim, kernel_size=patch_size, stride=patch_size)
+    patches_per_side = image_size // patch_size
+    num_patches = patches_per_side * patches_per_side
+    self.cls_token = nn.Parameter(torch.zeros(1, 1, embedding_dim))
+    self.positional_embedding = nn.Parameter(torch.zeros(1, num_patches + 1, embedding_dim))
+    encoder_layer = nn.TransformerEncoderLayer(
+      d_model=embedding_dim,
+      nhead=int(num_heads),
+      dim_feedforward=int(mlp_dim),
+      dropout=float(max(0.0, dropout_rate)),
+      activation='gelu',
+      batch_first=True,
+      norm_first=True,
+    )
+    self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=int(num_layers))
+    self.norm = nn.LayerNorm(embedding_dim)
+    self.dropout = nn.Dropout(p=float(max(0.0, dropout_rate)))
+    self.classifier = nn.Sequential(
+      nn.Linear(embedding_dim * 2, mlp_dim),
+      nn.GELU(),
+      nn.Dropout(p=float(max(0.0, dropout_rate))),
+      nn.Linear(mlp_dim, num_classes),
+    )
+    nn.init.trunc_normal_(self.cls_token, std=0.02)
+    nn.init.trunc_normal_(self.positional_embedding, std=0.02)
+
+  def forward(self, x):
+    cnn_features = self.cnn_branch(x).flatten(1)
+    cnn_features = self.cnn_projection(cnn_features)
+
+    patch_tokens = self.patch_embed(x).flatten(2).transpose(1, 2)
+    cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
+    transformer_tokens = torch.cat([cls_tokens, patch_tokens], dim=1)
+    transformer_tokens = transformer_tokens + self.positional_embedding[:, :transformer_tokens.shape[1], :]
+    transformer_tokens = self.transformer(transformer_tokens)
+    transformer_features = self.norm(transformer_tokens[:, 0, :])
+
+    fused_features = torch.cat([cnn_features, transformer_features], dim=1)
+    fused_features = self.dropout(fused_features)
+    return self.classifier(fused_features)
   
 class CustomDataset(Dataset):
   def __init__(self, data, labels):
@@ -2464,6 +2602,53 @@ def build_transfer_learning_model(config):
       'input_normalization': 'scaled_connectivity',
     }
 
+  if model_type == 'brainnet_cnn':
+    model = BrainNetCNNClassifier(
+      dropout_rate=config.transfer_dropout_rate,
+      num_classes=2,
+      base_channels=config.brainnet_base_channels,
+    ).to(device)
+    return model, {
+      'pretrained_requested': False,
+      'pretrained_loaded': False,
+      'freeze_backbone': False,
+      'image_size': int(config.transfer_image_size),
+      'dropout_rate': float(config.transfer_dropout_rate),
+      'input_channels': 1,
+      'input_normalization': 'scaled_connectivity',
+      'architecture': 'brainnet_cnn',
+      'brainnet_base_channels': int(config.brainnet_base_channels),
+    }
+
+  if model_type == 'connectivity_vit_fusion':
+    model = ConnectivityViTFusionClassifier(
+      image_size=config.transfer_image_size,
+      patch_size=config.vit_patch_size,
+      embedding_dim=config.vit_embedding_dim,
+      num_heads=config.vit_num_heads,
+      num_layers=config.vit_num_layers,
+      mlp_dim=config.vit_mlp_dim,
+      dropout_rate=config.transfer_dropout_rate,
+      num_classes=2,
+      cnn_base_channels=config.brainnet_base_channels,
+    ).to(device)
+    return model, {
+      'pretrained_requested': False,
+      'pretrained_loaded': False,
+      'freeze_backbone': False,
+      'image_size': int(config.transfer_image_size),
+      'dropout_rate': float(config.transfer_dropout_rate),
+      'input_channels': 1,
+      'input_normalization': 'scaled_connectivity',
+      'architecture': 'connectivity_vit_fusion',
+      'vit_patch_size': int(config.vit_patch_size),
+      'vit_embedding_dim': int(config.vit_embedding_dim),
+      'vit_num_heads': int(config.vit_num_heads),
+      'vit_num_layers': int(config.vit_num_layers),
+      'vit_mlp_dim': int(config.vit_mlp_dim),
+      'cnn_base_channels': int(config.brainnet_base_channels),
+    }
+
   if tv_models is None:
     raise ImportError("torchvision is required for transfer learning backbones but is not installed.")
 
@@ -2521,7 +2706,7 @@ def build_transfer_learning_model(config):
 def build_connectivity_image_dataloader(features, labels, roi_pairs, roi_count, config, shuffle):
   model_type = normalize_model_type(config.model_type)
 
-  if model_type == 'connectivity_cnn':
+  if model_type in {'connectivity_cnn', 'brainnet_cnn', 'connectivity_vit_fusion'}:
     return build_transfer_learning_dataloader(
       features,
       labels,
@@ -2744,7 +2929,8 @@ def train_baseline_model(train_features, train_labels, validation_features, vali
   else:
     raise ValueError(
       f"Unknown model_type '{config.model_type}'. "
-      "Supported options: ssae, linear_svm, logistic_l1, logistic_elastic_net, hist_gradient_boosting, resnet18_transfer, efficientnet_b0_transfer, connectivity_cnn."
+      "Supported options: ssae, linear_svm, logistic_l1, logistic_elastic_net, hist_gradient_boosting, "
+      "resnet18_transfer, efficientnet_b0_transfer, connectivity_cnn, brainnet_cnn, connectivity_vit_fusion."
     )
 
   model.fit(train_features, train_labels)
@@ -3694,6 +3880,12 @@ def parse_reanalysis_log(log_path):
     'transfer_freeze_backbone',
     'transfer_image_size',
     'transfer_dropout_rate',
+    'brainnet_base_channels',
+    'vit_patch_size',
+    'vit_embedding_dim',
+    'vit_num_heads',
+    'vit_num_layers',
+    'vit_mlp_dim',
     'ssae_dropout_rate',
     'harmonization_method',
     'enable_confound_regression',
@@ -4084,7 +4276,7 @@ if __name__ == "__main__":
   parser.add_argument('--feature_transform', default='none', help='Optional fold-local transform applied after selection and scaling. Options: none, pca')
   parser.add_argument('--pca_components', type=int, default=0, help='Number of PCA components when --feature_transform pca. Use 0 to keep the full rank allowed by the training fold.')
   parser.add_argument('--selector_type', default='rfe', help='Feature selector to use inside each fold. Options: rfe, rfecv, anova_f, mutual_info, logistic_l1, mrmr, none')
-  parser.add_argument('--model_type', default='ssae', help='Model to train on the selected features. Options: ssae, linear_svm, logistic_l1, logistic_elastic_net, hist_gradient_boosting, resnet18_transfer, efficientnet_b0_transfer, connectivity_cnn')
+  parser.add_argument('--model_type', default='ssae', help='Model to train on the selected features. Options: ssae, linear_svm, logistic_l1, logistic_elastic_net, hist_gradient_boosting, resnet18_transfer, efficientnet_b0_transfer, connectivity_cnn, brainnet_cnn, connectivity_vit_fusion')
   parser.add_argument('--ae1_hidden_size', type=int, default=500, help='Hidden size for the first autoencoder layer.')
   parser.add_argument('--ae2_hidden_size', type=int, default=100, help='Hidden size for the second autoencoder layer.')
   parser.add_argument('--ssae_dropout_rate', type=float, default=0.0, help='Dropout rate applied between SSAE encoder layers during supervised classification and fine-tuning.')
@@ -4118,6 +4310,12 @@ if __name__ == "__main__":
   parser.add_argument('--transfer_freeze_backbone', type=lambda x: (str(x).lower() == 'true'), default=True, help='Freeze the transfer-learning backbone and train only the classifier head.')
   parser.add_argument('--transfer_image_size', type=int, default=128, help='Square image size used when converting connectivity matrices for transfer learning backbones.')
   parser.add_argument('--transfer_dropout_rate', type=float, default=0.2, help='Dropout applied before the transfer-learning classifier head.')
+  parser.add_argument('--brainnet_base_channels', type=int, default=16, help='Base channel width for connectivity_cnn, brainnet_cnn, and the CNN branch of connectivity_vit_fusion.')
+  parser.add_argument('--vit_patch_size', type=int, default=16, help='Patch size used by connectivity_vit_fusion. transfer_image_size must be divisible by this value.')
+  parser.add_argument('--vit_embedding_dim', type=int, default=64, help='Transformer embedding width used by connectivity_vit_fusion.')
+  parser.add_argument('--vit_num_heads', type=int, default=4, help='Number of transformer attention heads used by connectivity_vit_fusion.')
+  parser.add_argument('--vit_num_layers', type=int, default=2, help='Number of transformer encoder layers used by connectivity_vit_fusion.')
+  parser.add_argument('--vit_mlp_dim', type=int, default=128, help='Feed-forward hidden width used by connectivity_vit_fusion.')
   parser.add_argument('--harmonization_method', default='none', help='Optional leak-free harmonization stage fit on the training fold only. Options: none, combat')
   parser.add_argument('--harmonization_covariates', nargs='*', default=list(DEFAULT_HARMONIZATION_COVARIATES), help='Covariates to preserve during harmonization. Options: age, sex')
   parser.add_argument('--use_feature_scaling', type=lambda x: (str(x).lower() == 'true'), default=True, help='Scale selected features inside each fold using training data only.')
@@ -4171,6 +4369,12 @@ if __name__ == "__main__":
   print("transfer_freeze_backbone: ", args.transfer_freeze_backbone)
   print("transfer_image_size: ", args.transfer_image_size)
   print("transfer_dropout_rate: ", args.transfer_dropout_rate)
+  print("brainnet_base_channels: ", args.brainnet_base_channels)
+  print("vit_patch_size: ", args.vit_patch_size)
+  print("vit_embedding_dim: ", args.vit_embedding_dim)
+  print("vit_num_heads: ", args.vit_num_heads)
+  print("vit_num_layers: ", args.vit_num_layers)
+  print("vit_mlp_dim: ", args.vit_mlp_dim)
   print("ssae_dropout_rate: ", args.ssae_dropout_rate)
   print("harmonization_method: ", args.harmonization_method)
   print("enable_confound_regression: ", args.enable_confound_regression)
@@ -4244,6 +4448,12 @@ if __name__ == "__main__":
     transfer_freeze_backbone=args.transfer_freeze_backbone,
     transfer_image_size=args.transfer_image_size,
     transfer_dropout_rate=args.transfer_dropout_rate,
+    brainnet_base_channels=args.brainnet_base_channels,
+    vit_patch_size=args.vit_patch_size,
+    vit_embedding_dim=args.vit_embedding_dim,
+    vit_num_heads=args.vit_num_heads,
+    vit_num_layers=args.vit_num_layers,
+    vit_mlp_dim=args.vit_mlp_dim,
     harmonization_method=args.harmonization_method,
     harmonization_covariates=tuple(args.harmonization_covariates or ()),
     enable_confound_regression=args.enable_confound_regression,
