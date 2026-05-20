@@ -56,6 +56,37 @@ def determine_cv_splits(labels, maximum_splits=5):
   return max(2, min(int(maximum_splits), int(valid_counts.min())))
 
 
+def safe_stratified_split(indices, labels, holdout_fraction, random_state):
+  indices = np.asarray(indices, dtype=int)
+  labels = np.asarray(labels, dtype=int)
+  if len(indices) != len(labels):
+    raise ValueError("indices and labels must have the same length.")
+
+  unique_labels = np.unique(labels)
+  if len(unique_labels) < 2:
+    return None
+
+  label_counts = np.bincount(labels)
+  valid_counts = label_counts[label_counts > 0]
+  if len(valid_counts) < 2 or int(valid_counts.min()) < 2:
+    return None
+
+  desired_holdout = int(math.ceil(len(indices) * float(holdout_fraction)))
+  min_holdout = len(unique_labels)
+  max_holdout = len(indices) - len(unique_labels)
+  if max_holdout < min_holdout:
+    return None
+
+  holdout_size = min(max_holdout, max(min_holdout, desired_holdout))
+  train_indices, holdout_indices = train_test_split(
+    indices,
+    test_size=holdout_size,
+    stratify=labels,
+    random_state=random_state,
+  )
+  return np.asarray(train_indices, dtype=int), np.asarray(holdout_indices, dtype=int)
+
+
 def summarize_sites(subject_metadata, labels):
   metadata = subject_metadata.copy()
   metadata["label"] = np.asarray(labels, dtype=int)
@@ -145,23 +176,30 @@ def evaluate_single_site_candidates(site_name, data, labels, subject_metadata, b
 
 def stratified_site_splits(subject_metadata, labels, site_schedule, test_size, random_seed):
   splits = {}
+  skipped_sites = {}
   for offset, site_name in enumerate(site_schedule):
     site_mask = subject_metadata["site_id"].astype(str).eq(site_name).to_numpy()
     site_indices = np.where(site_mask)[0]
     site_labels = np.asarray(labels)[site_indices]
-    if len(np.unique(site_labels)) < 2:
-      continue
-    train_idx, test_idx = train_test_split(
+    split = safe_stratified_split(
       site_indices,
-      test_size=test_size,
-      stratify=site_labels,
+      site_labels,
+      holdout_fraction=test_size,
       random_state=random_seed + offset,
     )
+    if split is None:
+      skipped_sites[site_name] = {
+        "reason": "insufficient_samples_for_stratified_split",
+        "total": int(len(site_indices)),
+        "class_counts": np.bincount(site_labels, minlength=2).tolist(),
+      }
+      continue
+    train_idx, test_idx = split
     splits[site_name] = {
       "train_indices": np.asarray(train_idx, dtype=int),
       "test_indices": np.asarray(test_idx, dtype=int),
     }
-  return splits
+  return splits, skipped_sites
 
 
 def make_class_weight_tensor(labels):
@@ -292,19 +330,28 @@ def sample_replay_features(seen_train_store, replay_samples_per_site, random_see
 
 def run_progressive_adaptation(data, labels, subject_metadata, source_site, site_schedule, artifact_root, base_config, verbose, test_size=0.2):
   features, _ = build_edge_vector_features(data)
-  site_splits = stratified_site_splits(subject_metadata, labels, site_schedule, test_size=test_size, random_seed=base_config.random_seed)
+  site_splits, skipped_sites = stratified_site_splits(
+    subject_metadata,
+    labels,
+    site_schedule,
+    test_size=test_size,
+    random_seed=base_config.random_seed,
+  )
   if source_site not in site_splits:
     raise ValueError(f"Source site '{source_site}' does not have a valid train/test split.")
 
   source_train_indices = site_splits[source_site]["train_indices"]
   source_test_indices = site_splits[source_site]["test_indices"]
   source_train_labels = labels[source_train_indices]
-  inner_train_idx, inner_val_idx = train_test_split(
+  source_inner_split = safe_stratified_split(
     source_train_indices,
-    test_size=0.2,
-    stratify=source_train_labels,
+    source_train_labels,
+    holdout_fraction=0.2,
     random_state=base_config.random_seed,
   )
+  if source_inner_split is None:
+    raise ValueError(f"Source site '{source_site}' does not have enough training samples for an inner validation split.")
+  inner_train_idx, inner_val_idx = source_inner_split
 
   scaler = StandardScaler()
   scaler.fit(features[inner_train_idx])
@@ -351,12 +398,22 @@ def run_progressive_adaptation(data, labels, subject_metadata, source_site, site
       seen_sites.append(site_name)
       seen_train_store.append((site_name, all_transformed[train_indices], labels[train_indices]))
     else:
-      current_train_indices, current_val_indices = train_test_split(
+      current_split = safe_stratified_split(
         train_indices,
-        test_size=0.2,
-        stratify=labels[train_indices],
+        labels[train_indices],
+        holdout_fraction=0.2,
         random_state=base_config.random_seed + stage_index,
       )
+      if current_split is None:
+        stage_records.append({
+          "stage_index": stage_index,
+          "site_name": site_name,
+          "seen_sites": list(seen_sites),
+          "skipped": True,
+          "reason": "insufficient_samples_for_inner_validation_split",
+        })
+        continue
+      current_train_indices, current_val_indices = current_split
       replay_features, replay_labels = sample_replay_features(
         seen_train_store,
         replay_samples_per_site=64,
@@ -410,6 +467,7 @@ def run_progressive_adaptation(data, labels, subject_metadata, source_site, site
     "stage_records": stage_records,
     "source_site": source_site,
     "site_schedule": site_schedule,
+    "skipped_sites": skipped_sites,
     "pca_components": int(base_config.pca_components),
     "model_type": "progressive_logistic_replay",
     "feature_representation": base_config.feature_representation,
