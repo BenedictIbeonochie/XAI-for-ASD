@@ -4,6 +4,10 @@ This is a separate experiment runner for testing a matrix-native CNN on
 subject-level Fisher-z connectivity matrices. It does not use flattened edge
 vectors, PCA, RFE, RFECV, or resized connectivity images.
 
+The current runner uses a deeper residual-style 2D CNN, not the original
+three-block shallow baseline. It trains directly on each subject's native
+`ROI x ROI` connectivity matrix.
+
 The script lives at [connectivity_cnn.py](/C:/Users/bibe/Downloads/XAI-for-ASD/connectivity_cnn.py).
 
 ## Server commands
@@ -20,8 +24,8 @@ python3 -u connectivity_cnn.py \
   --learning_rate 1e-3 \
   --weight_decay 1e-2 \
   --batch_size 16 \
-  --epochs 200 \
-  --patience 25 \
+  --epochs 400 \
+  --patience 75 \
   --verbose true
 ```
 
@@ -37,8 +41,8 @@ python3 -u connectivity_cnn.py \
   --learning_rate 1e-3 \
   --weight_decay 1e-2 \
   --batch_size 16 \
-  --epochs 200 \
-  --patience 25 \
+  --epochs 400 \
+  --patience 75 \
   --verbose true
 ```
 
@@ -55,8 +59,8 @@ python3 -u connectivity_cnn.py \
   --learning_rate 1e-3 \
   --weight_decay 1e-2 \
   --batch_size 16 \
-  --epochs 200 \
-  --patience 25 \
+  --epochs 400 \
+  --patience 75 \
   --verbose true
 ```
 

@@ -41,6 +41,8 @@ DEFAULT_VALIDATION_SIZE = 0.2
 MAX_CNN_SPLITS = 5
 MIN_MANUAL_SITE_SUBJECTS = 10
 GRADIENT_CLIP_NORM = 1.0
+DEFAULT_EPOCHS = 400
+DEFAULT_PATIENCE = 75
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -54,8 +56,8 @@ class ConnectivityCNNConfig:
     learning_rate: float = 1e-3
     weight_decay: float = 1e-2
     batch_size: int = 16
-    epochs: int = 200
-    patience: int = 25
+    epochs: int = DEFAULT_EPOCHS
+    patience: int = DEFAULT_PATIENCE
     min_delta: float = 1e-4
     artifact_root: str = "artifacts/connectivity_cnn"
     validation_size: float = DEFAULT_VALIDATION_SIZE
@@ -63,45 +65,88 @@ class ConnectivityCNNConfig:
     max_splits: int = MAX_CNN_SPLITS
 
 
+class ResidualConvBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1, dropout: float = 0.0):
+        super().__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=False,
+        )
+        self.norm1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+        )
+        self.norm2 = nn.BatchNorm2d(out_channels)
+        self.activation = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout2d(float(dropout)) if float(dropout) > 0.0 else nn.Identity()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self.shortcut(x)
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        x = self.conv2(x)
+        x = self.norm2(x)
+        x = x + residual
+        return self.activation(x)
+
+
 class ConnectivityCNN(nn.Module):
-    """Three-block CNN for native connectivity matrices."""
+    """Deeper residual CNN for native connectivity matrices."""
 
     def __init__(self, n_rois: int, dropout: float = 0.5, num_classes: int = 2):
         super().__init__()
         self.n_rois = int(n_rois)
-        self.features = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=5, stride=1, padding=2),
+        drop = float(dropout)
+        self.stem = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=5, stride=1, padding=2, bias=False),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-            nn.Dropout2d(float(dropout) * 0.5),
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-            nn.Dropout2d(float(dropout) * 0.5),
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d(4),
-            nn.Dropout2d(float(dropout)),
+        )
+        self.features = nn.Sequential(
+            ResidualConvBlock(32, 32, stride=1, dropout=drop * 0.10),
+            ResidualConvBlock(32, 64, stride=2, dropout=drop * 0.15),
+            ResidualConvBlock(64, 64, stride=1, dropout=drop * 0.15),
+            ResidualConvBlock(64, 128, stride=2, dropout=drop * 0.20),
+            ResidualConvBlock(128, 128, stride=1, dropout=drop * 0.20),
+            ResidualConvBlock(128, 256, stride=2, dropout=drop * 0.25),
+            ResidualConvBlock(256, 256, stride=1, dropout=drop * 0.25),
+            nn.AdaptiveAvgPool2d(1),
         )
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(128 * 4 * 4, 128),
+            nn.Linear(256, 128),
             nn.BatchNorm1d(128),
             nn.ReLU(inplace=True),
-            nn.Dropout(float(dropout)),
+            nn.Dropout(drop),
             nn.Linear(128, 32),
             nn.BatchNorm1d(32),
             nn.ReLU(inplace=True),
-            nn.Dropout(float(dropout)),
+            nn.Dropout(drop),
             nn.Linear(32, num_classes),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 3:
             x = x.unsqueeze(1)
+        x = self.stem(x)
         x = self.features(x)
         return self.classifier(x)
 
@@ -350,7 +395,12 @@ def train_connectivity_cnn(
     train_dataloader = build_dataloader(train_matrices, train_labels, config.batch_size, shuffle=True)
     validation_dataloader = build_dataloader(validation_matrices, validation_labels, config.batch_size, shuffle=False)
 
-    criterion = nn.CrossEntropyLoss()
+    class_counts = np.bincount(np.asarray(train_labels, dtype=int), minlength=2).astype(np.float32)
+    class_counts = np.maximum(class_counts, 1.0)
+    class_weights = class_counts.sum() / (len(class_counts) * class_counts)
+    criterion = nn.CrossEntropyLoss(
+        weight=torch.tensor(class_weights, dtype=torch.float32, device=device)
+    )
     optimizer = optim.AdamW(
         model.parameters(),
         lr=float(config.learning_rate),
@@ -366,7 +416,7 @@ def train_connectivity_cnn(
 
     if verbose:
         n_parameters = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
-        print(f"  Model: ConnectivityCNN, Parameters: {n_parameters:,}")
+        print(f"  Model: {model.__class__.__name__}, Parameters: {n_parameters:,}")
 
     for epoch in range(int(config.epochs)):
         model.train()
@@ -424,13 +474,16 @@ def train_connectivity_cnn(
     model.to(device)
 
     return model, {
-        "model_type": "connectivity_cnn",
+        "model_type": "deep_connectivity_cnn",
+        "model_name": model.__class__.__name__,
         "device": str(device),
         "n_rois": n_rois,
+        "n_parameters": int(sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)),
         "dropout": float(config.dropout),
         "learning_rate": float(config.learning_rate),
         "weight_decay": float(config.weight_decay),
         "batch_size": int(config.batch_size),
+        "class_weights": [float(weight) for weight in class_weights.tolist()],
         "epochs_requested": int(config.epochs),
         "epochs_trained": len(history),
         "best_epoch": int(best_epoch),
@@ -782,8 +835,8 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-2)
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--patience", type=int, default=25)
+    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    parser.add_argument("--patience", type=int, default=DEFAULT_PATIENCE)
     parser.add_argument("--min_delta", type=float, default=1e-4)
     parser.add_argument("--artifact_root", default="artifacts/connectivity_cnn")
     parser.add_argument("--verbose", type=lambda x: str(x).lower() == "true", default=True)

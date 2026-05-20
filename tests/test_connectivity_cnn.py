@@ -81,6 +81,13 @@ class ConnectivityCNNTests(unittest.TestCase):
         self.assertTrue(np.allclose(matrices, np.transpose(matrices, (0, 2, 1))))
         self.assertTrue(np.allclose(np.diagonal(matrices, axis1=1, axis2=2), 0.0))
 
+    def test_connectivity_cnn_accepts_native_2d_matrix_batches(self):
+        model = connectivity_cnn.ConnectivityCNN(n_rois=116, dropout=0.5)
+        batch = np.zeros((3, 116, 116), dtype=np.float32)
+        outputs = model(connectivity_cnn.torch.tensor(batch))
+
+        self.assertEqual(tuple(outputs.shape), (3, 2))
+
     def test_resolve_roi_atlas_alias_falls_back_from_fd_suffix(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             downloads_root = Path(temp_dir) / "Outputs"
