@@ -114,6 +114,21 @@ class SubjectSummaryFusionTests(unittest.TestCase):
         self.assertEqual(eligible_sites, ["NYU", "UCLA_1"])
         self.assertEqual({record["site_id"] for record in skipped_sites}, {"SMALL", "ONECLASS"})
 
+    def test_load_subject_dataset_for_pipeline_uses_empty_site_filters(self):
+        data, labels, metadata = make_synthetic_roi_timeseries_dataset()
+        config = self.make_fast_config("artifacts/test_loader")
+
+        with patch("subject_summary_fusion.get_data_from_abide", return_value=(data, labels, metadata)) as mocked_loader:
+            loaded_data, loaded_labels, loaded_metadata = subject_summary_fusion.load_subject_dataset_for_pipeline(
+                "dparsf",
+                config,
+            )
+
+        self.assertEqual(len(loaded_data), len(data))
+        self.assertTrue(np.array_equal(loaded_labels, labels))
+        self.assertEqual(len(loaded_metadata), len(metadata))
+        self.assertEqual(mocked_loader.call_args.kwargs["site_filters"], ())
+
     def test_run_pipeline_loso_experiment_writes_artifacts_and_keeps_held_out_site_out_of_fit_artifacts(self):
         data, labels, metadata = make_synthetic_roi_timeseries_dataset()
 

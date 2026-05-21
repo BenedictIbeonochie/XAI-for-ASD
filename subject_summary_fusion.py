@@ -980,7 +980,7 @@ def load_subject_dataset_for_pipeline(
         pipeline,
         preprocessing_condition=config.preprocessing_condition,
         roi_atlas=config.roi_atlas,
-        site_filters=normalize_site_filters(()),
+        site_filters=(),
         return_subject_metadata=True,
     )
     return list(data), np.asarray(labels, dtype=int), subject_metadata.reset_index(drop=True)
