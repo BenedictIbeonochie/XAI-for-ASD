@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+from sklearn.svm import SVC
 
 import subject_summary_fusion
 
@@ -99,6 +100,11 @@ class SubjectSummaryFusionTests(unittest.TestCase):
 
         self.assertEqual(labels, ["rois_aal_000", "rois_aal_001", "rois_aal_002", "rois_aal_003"])
 
+    def test_build_classifier_supports_stronger_rbf_svm_backend(self):
+        model = subject_summary_fusion.build_classifier("rbf_svm", random_seed=123)
+        self.assertIsInstance(model, SVC)
+        self.assertTrue(model.probability)
+
     def test_determine_loso_sites_skips_small_or_single_class_sites(self):
         site_summary = pd.DataFrame(
             [
@@ -128,6 +134,34 @@ class SubjectSummaryFusionTests(unittest.TestCase):
         self.assertTrue(np.array_equal(loaded_labels, labels))
         self.assertEqual(len(loaded_metadata), len(metadata))
         self.assertEqual(mocked_loader.call_args.kwargs["site_filters"], ())
+
+    def test_single_held_out_site_mode_runs_only_requested_site(self):
+        data, labels, metadata = make_synthetic_roi_timeseries_dataset()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.make_fast_config(
+                temp_dir,
+                held_out_site="NYU",
+                classifier_type="rbf_svm",
+            )
+            with patch("subject_summary_fusion.get_data_from_abide", return_value=(data, labels, metadata)), patch(
+                "subject_summary_fusion.resolve_roi_labels",
+                return_value=["ROI_0", "ROI_1", "ROI_2", "ROI_3"],
+            ):
+                summary = subject_summary_fusion.run_pipeline_loso_experiment(
+                    pipeline="dparsf",
+                    config=config,
+                    verbose=False,
+                )
+
+            self.assertEqual(summary["evaluation_mode"], "single_held_out_site")
+            self.assertEqual(summary["held_out_site"], "NYU")
+            self.assertEqual(summary["evaluation_sites"], ["NYU"])
+            self.assertEqual(summary["eligible_sites"], ["NYU", "UCLA_1", "USM"])
+
+            artifact_dir = Path(summary["artifact_dir"])
+            subject_summaries = pd.read_csv(artifact_dir / "subject_summaries.csv")
+            self.assertEqual(subject_summaries["held_out_site"].unique().tolist(), ["NYU"])
 
     def test_run_pipeline_loso_experiment_writes_artifacts_and_keeps_held_out_site_out_of_fit_artifacts(self):
         data, labels, metadata = make_synthetic_roi_timeseries_dataset()

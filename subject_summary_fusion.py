@@ -26,6 +26,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
 
 from app.main import (
     DEFAULT_PREPROCESSING_CONDITION,
@@ -47,14 +48,23 @@ DEFAULT_ARTIFACT_ROOT = "artifacts/subject_summary_fusion"
 DEFAULT_TOP_ROIS_PER_SECTION = 5
 DEFAULT_TOP_CONTRIBUTION_FEATURES = 5
 DEFAULT_TOP_TOKEN_COUNT = 20
+DEFAULT_CLASSIFIER_TYPE = "rbf_svm"
 
-CLASSIFIER_PARAMS = {
+LOGISTIC_CLASSIFIER_PARAMS = {
     "solver": "saga",
     "penalty": "elasticnet",
     "l1_ratio": 0.5,
     "C": 0.1,
     "class_weight": "balanced",
     "max_iter": 5000,
+}
+
+RBF_SVM_CLASSIFIER_PARAMS = {
+    "kernel": "rbf",
+    "C": 2.0,
+    "gamma": "scale",
+    "class_weight": "balanced",
+    "probability": True,
 }
 
 ROI_METRIC_SPECS = (
@@ -99,6 +109,8 @@ class SubjectSummaryFusionConfig:
     validation_size: float = DEFAULT_VALIDATION_SIZE
     artifact_root: str = DEFAULT_ARTIFACT_ROOT
     random_seed: int = DEFAULT_SEED
+    classifier_type: str = DEFAULT_CLASSIFIER_TYPE
+    held_out_site: str | None = None
     top_rois_per_section: int = DEFAULT_TOP_ROIS_PER_SECTION
     top_contribution_features: int = DEFAULT_TOP_CONTRIBUTION_FEATURES
     top_token_count: int = DEFAULT_TOP_TOKEN_COUNT
@@ -136,6 +148,35 @@ def slugify_label(value: str) -> str:
 
 def label_name_from_int(label: int) -> str:
     return "ASD" if int(label) == 0 else "Control"
+
+
+def normalize_classifier_type(classifier_type: str | None) -> str:
+    normalized = str(classifier_type or DEFAULT_CLASSIFIER_TYPE).strip().lower()
+    aliases = {
+        "logistic": "logistic_elasticnet",
+        "logistic_regression": "logistic_elasticnet",
+        "elasticnet_logistic": "logistic_elasticnet",
+        "logistic_elasticnet": "logistic_elasticnet",
+        "svm": "rbf_svm",
+        "svc": "rbf_svm",
+        "rbf_svm": "rbf_svm",
+        "rbf_svc": "rbf_svm",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            f"Unknown classifier_type '{classifier_type}'. "
+            "Supported options: logistic_elasticnet, rbf_svm."
+        )
+    return aliases[normalized]
+
+
+def get_classifier_params(classifier_type: str) -> dict:
+    normalized = normalize_classifier_type(classifier_type)
+    if normalized == "logistic_elasticnet":
+        return dict(LOGISTIC_CLASSIFIER_PARAMS)
+    if normalized == "rbf_svm":
+        return dict(RBF_SVM_CLASSIFIER_PARAMS)
+    raise ValueError(f"Unsupported classifier_type '{classifier_type}'.")
 
 
 def summarize_metric(values: Iterable[float]) -> dict[str, float]:
@@ -547,11 +588,19 @@ def build_ablation_feature_blocks(
     }
 
 
-def build_classifier(random_seed: int) -> LogisticRegression:
-    return LogisticRegression(
-        random_state=int(random_seed),
-        **CLASSIFIER_PARAMS,
-    )
+def build_classifier(classifier_type: str, random_seed: int):
+    normalized = normalize_classifier_type(classifier_type)
+    if normalized == "logistic_elasticnet":
+        return LogisticRegression(
+            random_state=int(random_seed),
+            **LOGISTIC_CLASSIFIER_PARAMS,
+        )
+    if normalized == "rbf_svm":
+        return SVC(
+            random_state=int(random_seed),
+            **RBF_SVM_CLASSIFIER_PARAMS,
+        )
+    raise ValueError(f"Unsupported classifier_type '{classifier_type}'.")
 
 
 def predict_asd_probability(model: LogisticRegression, feature_matrix: sparse.csr_matrix) -> np.ndarray:
@@ -565,6 +614,7 @@ def train_and_evaluate_ablation_models(
     train_labels: np.ndarray,
     eval_blocks: dict[str, sparse.csr_matrix],
     eval_labels: np.ndarray,
+    classifier_type: str,
     random_seed: int,
 ) -> dict[str, dict]:
     results = {}
@@ -572,19 +622,23 @@ def train_and_evaluate_ablation_models(
     eval_labels = np.asarray(eval_labels, dtype=int)
 
     for offset, ablation_name in enumerate(ABLATION_ORDER):
-        model = build_classifier(random_seed + offset)
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message=r".*'penalty' was deprecated.*",
-                category=FutureWarning,
-            )
+        model = build_classifier(classifier_type, random_seed + offset)
+        if normalize_classifier_type(classifier_type) == "logistic_elasticnet":
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r".*'penalty' was deprecated.*",
+                    category=FutureWarning,
+                )
+                model.fit(train_blocks[ablation_name], train_labels)
+        else:
             model.fit(train_blocks[ablation_name], train_labels)
         predicted_labels = model.predict(eval_blocks[ablation_name]).astype(int)
         predicted_probability_asd = predict_asd_probability(model, eval_blocks[ablation_name])
         metrics = compute_binary_metrics(eval_labels, predicted_labels, positive_label=0)
         results[ablation_name] = {
             "model": model,
+            "classifier_type": normalize_classifier_type(classifier_type),
             "predicted_labels": predicted_labels,
             "predicted_probability_asd": predicted_probability_asd,
             "metrics": {key: float(value) for key, value in metrics.items() if key not in {"confusion_matrix"}},
@@ -848,6 +902,7 @@ def run_single_loso_round(
         inner_train_labels,
         validation_eval_blocks,
         validation_labels,
+        classifier_type=config.classifier_type,
         random_seed=config.random_seed,
     )
 
@@ -897,6 +952,7 @@ def run_single_loso_round(
         train_labels,
         test_blocks,
         test_labels,
+        classifier_type=config.classifier_type,
         random_seed=config.random_seed + 1000,
     )
 
@@ -1002,14 +1058,33 @@ def run_pipeline_loso_experiment(
     )
 
     site_summary = summarize_sites(prepared_dataset.subject_rows, labels)
-    eligible_sites, skipped_sites = determine_loso_sites(site_summary, config.min_site_subjects)
-    if len(eligible_sites) < 2:
+    all_eligible_sites, skipped_sites = determine_loso_sites(site_summary, config.min_site_subjects)
+    requested_held_out_site = str(config.held_out_site).strip() if config.held_out_site else None
+    if requested_held_out_site:
+        if requested_held_out_site not in site_summary.index:
+            raise ValueError(
+                f"Held-out site '{requested_held_out_site}' is not present in the loaded cohort. "
+                f"Available sites: {site_summary.index.tolist()}"
+            )
+        if requested_held_out_site not in all_eligible_sites:
+            skip_lookup = {record["site_id"]: record["reason"] for record in skipped_sites}
+            reason = skip_lookup.get(requested_held_out_site, "unknown_reason")
+            raise ValueError(
+                f"Held-out site '{requested_held_out_site}' is not eligible for evaluation: {reason}."
+            )
+        evaluation_sites = [requested_held_out_site]
+    else:
+        evaluation_sites = list(all_eligible_sites)
+
+    if not requested_held_out_site and len(all_eligible_sites) < 2:
         raise ValueError(
-            f"Need at least 2 eligible LOSO sites, found {len(eligible_sites)}. "
+            f"Need at least 2 eligible LOSO sites, found {len(all_eligible_sites)}. "
             f"Skipped sites: {skipped_sites}"
         )
+    if requested_held_out_site and len(all_eligible_sites) < 2:
+        raise ValueError("A single held-out-site evaluation still requires at least one additional eligible training site.")
 
-    eligible_dataset, eligible_indices = filter_to_eligible_sites(prepared_dataset, eligible_sites)
+    eligible_dataset, eligible_indices = filter_to_eligible_sites(prepared_dataset, all_eligible_sites)
     eligible_labels = labels[eligible_indices]
 
     artifact_dir = ensure_directory(
@@ -1017,7 +1092,7 @@ def run_pipeline_loso_experiment(
         / pipeline
         / config.preprocessing_condition
         / slugify_label(config.roi_atlas)
-        / "loso_all_sites"
+        / ("held_out_" + slugify_label(requested_held_out_site) if requested_held_out_site else "loso_all_sites")
     )
 
     if verbose:
@@ -1027,11 +1102,14 @@ def run_pipeline_loso_experiment(
         print(f"Pipeline: {pipeline}")
         print(f"Preprocessing: {config.preprocessing_condition}")
         print(f"ROI Atlas: {config.roi_atlas}")
+        print(f"Classifier: {normalize_classifier_type(config.classifier_type)}")
         print(
             f"Eligible subjects: {len(eligible_subject_rows)} "
             f"({int((eligible_labels == 0).sum())} ASD, {int((eligible_labels == 1).sum())} control)"
         )
-        print(f"Eligible held-out sites: {eligible_sites}")
+        print(f"Eligible held-out sites: {all_eligible_sites}")
+        if requested_held_out_site:
+            print(f"Requested held-out site: {requested_held_out_site}")
         if skipped_sites:
             print(f"Skipped sites: {[record['site_id'] for record in skipped_sites]}")
         print(f"{'=' * 76}")
@@ -1041,7 +1119,7 @@ def run_pipeline_loso_experiment(
     prototype_records = []
     token_records = []
 
-    for held_out_site in eligible_sites:
+    for held_out_site in evaluation_sites:
         round_result = run_single_loso_round(
             prepared_dataset=eligible_dataset,
             held_out_site=held_out_site,
@@ -1097,10 +1175,13 @@ def run_pipeline_loso_experiment(
         "pipeline": pipeline,
         "preprocessing_condition": config.preprocessing_condition,
         "roi_atlas": config.roi_atlas,
+        "evaluation_mode": "single_held_out_site" if requested_held_out_site else "loso_all_sites",
+        "held_out_site": requested_held_out_site,
         "artifact_dir": str(artifact_dir),
         "total_subjects_loaded": int(len(labels)),
         "eligible_subjects": int(len(eligible_dataset.subject_rows)),
-        "eligible_sites": list(eligible_sites),
+        "eligible_sites": list(all_eligible_sites),
+        "evaluation_sites": list(evaluation_sites),
         "skipped_sites": skipped_sites,
         "site_summary": site_summary.reset_index().to_dict(orient="records"),
         "aggregate_metrics": aggregate_metrics,
@@ -1117,7 +1198,8 @@ def run_pipeline_loso_experiment(
                 "contrast_summary_text",
             ],
             "prototype_feature_count": 3,
-            "classifier": CLASSIFIER_PARAMS,
+            "classifier_type": normalize_classifier_type(config.classifier_type),
+            "classifier": get_classifier_params(config.classifier_type),
             "random_seed": int(config.random_seed),
         },
     }
@@ -1136,6 +1218,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min_site_subjects", type=int, default=DEFAULT_MIN_SITE_SUBJECTS)
     parser.add_argument("--validation_size", type=float, default=DEFAULT_VALIDATION_SIZE)
     parser.add_argument("--random_seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--classifier_type", default=DEFAULT_CLASSIFIER_TYPE, help="Classifier backend: logistic_elasticnet or rbf_svm.")
+    parser.add_argument("--held_out_site", default=None, help="Optional single site to hold out once, e.g. --held_out_site NYU")
     parser.add_argument("--verbose", type=lambda value: str(value).lower() == "true", default=True)
     return parser.parse_args()
 
@@ -1149,6 +1233,8 @@ def main() -> None:
         min_site_subjects=args.min_site_subjects,
         validation_size=args.validation_size,
         random_seed=args.random_seed,
+        classifier_type=args.classifier_type,
+        held_out_site=args.held_out_site,
     )
 
     for pipeline in args.pipelines:
